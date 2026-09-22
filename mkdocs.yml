@@ -1,0 +1,13 @@
+site_name: MLX Ternary
+site_description: High-performance Apple Silicon runtime for 1.58-bit ternary language models.
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.indexes
+
+nav:
+  - Home: index.md
+  - API Reference: api.md
+  - Architecture: architecture.md
+  - Building from Source: building.md

@@ -16,13 +16,27 @@ FetchContent_Declare(
 # This will pull down MLX and make its targets available (e.g., `mlx`)
 FetchContent_MakeAvailable(mlx)
 
+find_package(Python COMPONENTS Interpreter REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
-# 2. Compile our Python extension
+# 2. Convert Metal Shader to C++ Header for JIT
+set(METAL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/mlx_ternary/cpp/ternary.metal")
+set(METAL_HEADER "${CMAKE_CURRENT_BINARY_DIR}/ternary_metal.h")
+
+add_custom_command(
+    OUTPUT ${METAL_HEADER}
+    COMMAND ${Python_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/metal_to_h.py" ${METAL_SOURCE} ${METAL_HEADER}
+    DEPENDS ${METAL_SOURCE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/metal_to_h.py"
+    COMMENT "Generating C++ header from Metal shader..."
+)
+
+# 3. Compile our Python extension
 pybind11_add_module(mlx_ternary_ext 
     src/mlx_ternary/cpp/extension.cpp
     src/mlx_ternary/cpp/TernaryOp.cpp
+    ${METAL_HEADER} # Depend on the generated header
 )
+target_include_directories(mlx_ternary_ext PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 # 3. Link our extension against Apple's MLX C++ library
 target_link_libraries(mlx_ternary_ext PRIVATE mlx)
