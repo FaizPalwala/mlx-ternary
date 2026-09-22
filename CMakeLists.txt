@@ -13,6 +13,14 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/ml-explore/mlx.git
   GIT_TAG        v0.16.0
 )
+
+# Disable unnecessary MLX targets (tests, examples, bindings) to speed up build
+# and fix old CMake compatibility issues with doctest
+set(BUILD_TESTS OFF CACHE BOOL "Disable MLX tests" FORCE)
+set(BUILD_EXAMPLES OFF CACHE BOOL "Disable MLX examples" FORCE)
+set(BUILD_PYTHON_BINDINGS OFF CACHE BOOL "Disable MLX python" FORCE)
+set(MLX_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "Disable MLX python" FORCE)
+
 # This will pull down MLX and make its targets available (e.g., `mlx`)
 FetchContent_MakeAvailable(mlx)
 
