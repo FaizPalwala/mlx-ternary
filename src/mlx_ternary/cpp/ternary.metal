@@ -1,11 +1,22 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// 2-bit packed ternary weights: 
-// 00 -> 0
-// 01 -> 1
-// 10 -> -1
-// 11 -> unused (or 0)
+/* =====================================================================
+ * FUNCTIONAL SPECIFICATION: Ternary MatMul Kernel (Un-Fused v1.0)
+ * =====================================================================
+ * This kernel performs a forward-pass matrix multiplication optimized
+ * for 1.58-bit ternary language models.
+ * 
+ * DESIGN DECISIONS:
+ * 1. 2-bit Packing: We assume weights are packed 4-to-a-byte (uint8_t).
+ *    Mapping: 00 -> 0.0, 01 -> 1.0, 10 -> -1.0.
+ * 2. Un-Fused Scaling: This kernel ONLY computes the integer accumulation
+ *    of the ternary weights. It DOES NOT apply the fp16 scaling factor.
+ *    Scaling must be handled upstream in the MLX computation graph.
+ * 3. ALU Starvation: By branching on the weight value (-1, 0, 1), we
+ *    execute pure addition/subtraction, bypassing FP16 multiplication.
+ * =====================================================================
+ */
 
 inline float16_t unpack_ternary(uint8_t packed, uint index) {
     uint8_t val = (packed >> (index * 2)) & 0x3;
