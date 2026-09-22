@@ -1,10 +1,14 @@
 from .mlx_ternary_ext import ternary_matmul
+from .loader import load_ternary_model
 
 def load(model_path: str):
     """
     Load a ternary model from safetensors.
     """
-    raise NotImplementedError("Ternary model loading not yet implemented.")
+    weights, scales = load_ternary_model(model_path)
+    # Placeholder for instantiating the actual NN architecture
+    # model = TernaryLlama(weights, scales)
+    return weights, scales
 
 def generate(model, tokenizer, prompt: str):
     """
