@@ -1,4 +1,4 @@
-from .mlx_ternary_ext import add_stub
+from .mlx_ternary_ext import ternary_matmul
 
 def load(model_path: str):
     """
@@ -12,4 +12,4 @@ def generate(model, tokenizer, prompt: str):
     """
     raise NotImplementedError("Ternary text generation not yet implemented.")
 
-__all__ = ["load", "generate", "add_stub"]
+__all__ = ["load", "generate", "ternary_matmul"]

@@ -1,13 +1,58 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Placeholder for ternary addition kernel
-// Bypasses FP16 multipliers
-kernel void ternary_add_stub(
-    device const float16_t* weights [[buffer(0)]],
-    device const float16_t* activations [[buffer(1)]],
-    device float16_t* output [[buffer(2)]],
-    uint id [[thread_position_in_grid]]
+// 2-bit packed ternary weights: 
+// 00 -> 0
+// 01 -> 1
+// 10 -> -1
+// 11 -> unused (or 0)
+
+inline float16_t unpack_ternary(uint8_t packed, uint index) {
+    uint8_t val = (packed >> (index * 2)) & 0x3;
+    if (val == 1) return 1.0h;
+    if (val == 2) return -1.0h;
+    return 0.0h;
+}
+
+// Bypasses FP16 multipliers using control flow / addition
+kernel void ternary_matmul_kernel(
+    device const float16_t* activations [[buffer(0)]], // shape: (M, K)
+    device const uint8_t* packed_weights [[buffer(1)]], // shape: (K/4, N) - 4 weights per byte
+    device float16_t* output [[buffer(2)]], // shape: (M, N)
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
 ) {
-    // Stub implementation
+    uint row = gid.y; // M dimension
+    uint col = gid.x; // N dimension
+
+    if (row >= M || col >= N) {
+        return;
+    }
+
+    float16_t acc = 0.0h;
+
+    // Dot product loop
+    for (uint k = 0; k < K; k += 4) {
+        uint weight_idx = (k / 4) * N + col; // Assuming column-major or similar packing
+        uint8_t packed_w = packed_weights[weight_idx];
+
+        for (uint i = 0; i < 4; i++) {
+            if (k + i < K) {
+                float16_t w_val = unpack_ternary(packed_w, i);
+                float16_t x_val = activations[row * K + (k + i)];
+                
+                // Pure addition/subtraction branch
+                // (In a heavily optimized kernel, this would use bit-tricks to avoid branching)
+                if (w_val > 0.5h) {
+                    acc += x_val;
+                } else if (w_val < -0.5h) {
+                    acc -= x_val;
+                }
+            }
+        }
+    }
+
+    output[row * N + col] = acc;
 }

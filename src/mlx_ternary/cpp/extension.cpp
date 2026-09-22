@@ -1,12 +1,10 @@
 #include <pybind11/pybind11.h>
+#include "TernaryOp.h"
 
 namespace py = pybind11;
 
-int add_stub(int i, int j) {
-    return i + j;
-}
-
 PYBIND11_MODULE(mlx_ternary_ext, m) {
     m.doc() = "MLX Ternary native C++ extension";
-    m.def("add_stub", &add_stub, "A stub function to verify bindings");
+    m.def("ternary_matmul", &mlx_ternary::ternary_matmul, "Ternary addition-only matrix multiplication",
+          py::arg("x"), py::arg("w"));
 }
