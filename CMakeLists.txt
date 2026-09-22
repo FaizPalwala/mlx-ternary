@@ -26,7 +26,7 @@ set(MLX_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "Disable MLX python" FORCE)
 # This will pull down MLX and make its targets available (e.g., `mlx`)
 FetchContent_MakeAvailable(mlx)
 
-find_package(Python COMPONENTS Interpreter REQUIRED)
+find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
 # 2. Convert Metal Shader to C++ Header for JIT
