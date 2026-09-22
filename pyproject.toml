@@ -1,0 +1,18 @@
+[build-system]
+requires = ["scikit-build-core", "pybind11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "mlx_ternary"
+version = "0.1.0"
+description = "High-performance Apple Silicon runtime for 1.58-bit ternary language models."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "mlx>=0.16.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
