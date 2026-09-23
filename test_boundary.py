@@ -3,10 +3,13 @@ import mlx_ternary
 
 def test_api_boundary():
     print("[1] Creating mock tensors in MLX...")
-    x = mx.random.normal((32, 128))
-    # Packed weights: (128 / 4, 64) -> (32, 64)
-    w_packed = mx.random.uniform(shape=(32, 64))
-    scales = mx.random.normal((64,))
+    x = mx.random.normal((32, 128)).astype(mx.float16)
+    
+    # Packed weights: (128 / 4, 64) -> (32, 64). We'll use uint8 for packing.
+    # 85 is 01010101 in binary, which corresponds to four 1s (mapped to 1.0).
+    w_packed = mx.full((32, 64), 85, dtype=mx.uint8) 
+    
+    scales = mx.ones((64,), dtype=mx.float16)
     
     print("[2] Hitting the C++ Extension Boundary...")
     try:
@@ -15,18 +18,16 @@ def test_api_boundary():
         
         # We need to evaluate the graph to force the GPU dispatch
         mx.eval(out)
-        print("Wait, it succeeded? This shouldn't happen because we put a throw std::runtime_error in eval_gpu!")
+        
+        print("\n[3] Execution Successful!")
+        print(f"Output shape: {out.shape}")
+        print(f"Output mean: {out.mean().item()}")
         
     except Exception as e:
-        print(f"\n[3] Caught expected error from C++ runtime:")
+        print(f"\n[3] Caught error from C++ runtime:")
         print(f"--- {type(e).__name__} ---")
         print(e)
         print("--------------------")
-        
-        if "Metal dispatch logic written but requires MLX MTL headers" in str(e):
-            print("\nSUCCESS! The PyBind11 bindings successfully translated mx.array to mlx::core::array, built the graph, and executed our C++ Primitive!")
-        else:
-            print("\nWARNING: This is not the error we expected. Pybind11 might be failing to cast MLX arrays.")
 
 if __name__ == "__main__":
     test_api_boundary()

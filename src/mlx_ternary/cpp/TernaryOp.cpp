@@ -12,7 +12,52 @@ void TernaryMatMul::eval_cpu(
 void TernaryMatMul::eval_gpu(
     const std::vector<mlx::core::array>& inputs,
     std::vector<mlx::core::array>& outputs) {
-    throw std::runtime_error("TernaryMatMul::eval_gpu: Metal dispatch logic written but requires MLX MTL headers to link.");
+    
+    auto& x = inputs[0];
+    auto& w_packed = inputs[1];
+    auto& scales = inputs[2];
+    auto& out = outputs[0];
+
+    // Allocate output
+    out.set_data(mlx::core::allocator::malloc_or_wait(out.nbytes()));
+
+    auto& s = stream();
+    auto& d = mlx::core::metal::device(s.device);
+
+    // JIT compile the metal shader from the auto-generated string header
+    auto lib = d.get_library("mlx_ternary", [&]() {
+        return std::string(ternary_metal_source);
+    });
+
+    auto kernel = d.get_kernel("ternary_matmul_kernel", lib);
+
+    auto& compute_encoder = mlx::core::metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    // Dimensions
+    uint M = 1;
+    for (int i = 0; i < x.ndim() - 1; ++i) M *= x.shape(i);
+    uint K = x.shape().back();
+    uint N = w_packed.shape().back();
+
+    compute_encoder.set_input_array(x, 0);
+    compute_encoder.set_input_array(w_packed, 1);
+    compute_encoder.set_input_array(scales, 2);
+    compute_encoder.set_output_array(out, 3);
+
+    compute_encoder.set_bytes(M, 4);
+    compute_encoder.set_bytes(K, 5);
+    compute_encoder.set_bytes(N, 6);
+
+    MTL::Size grid_dims = MTL::Size(N, M, 1);
+    
+    // Ensure threadgroups are well balanced
+    NS::UInteger max_threads = kernel->maxTotalThreadsPerThreadgroup();
+    NS::UInteger max_x = std::min<NS::UInteger>(N, max_threads);
+    NS::UInteger max_y = std::min<NS::UInteger>(M, max_threads / max_x);
+    MTL::Size group_dims = MTL::Size(max_x, max_y, 1);
+
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
 }
 
 mlx::core::array ternary_matmul(

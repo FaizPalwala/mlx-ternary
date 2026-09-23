@@ -29,10 +29,11 @@ inline float16_t unpack_ternary(uint8_t packed, uint index) {
 kernel void ternary_matmul_kernel(
     device const float16_t* activations [[buffer(0)]], // shape: (M, K)
     device const uint8_t* packed_weights [[buffer(1)]], // shape: (K/4, N) - 4 weights per byte
-    device float16_t* output [[buffer(2)]], // shape: (M, N)
-    constant uint& M [[buffer(3)]],
-    constant uint& K [[buffer(4)]],
-    constant uint& N [[buffer(5)]],
+    device const float16_t* scales [[buffer(2)]], // shape: (N) - scaling factor for each column
+    device float16_t* output [[buffer(3)]], // shape: (M, N)
+    constant uint& M [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint row = gid.y; // M dimension
@@ -65,5 +66,6 @@ kernel void ternary_matmul_kernel(
         }
     }
 
-    output[row * N + col] = acc;
+    // Apply scale and write out
+    output[row * N + col] = acc * scales[col];
 }
