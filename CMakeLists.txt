@@ -27,7 +27,15 @@ set(MLX_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "Disable MLX python" FORCE)
 FetchContent_MakeAvailable(mlx)
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
-find_package(pybind11 CONFIG REQUIRED)
+
+# Fetch nanobind instead of pybind11
+FetchContent_Declare(
+  nanobind
+  GIT_REPOSITORY https://github.com/wjakob/nanobind.git
+  GIT_TAG v2.1.0  # Stable nanobind version
+  GIT_SHALLOW TRUE
+  EXCLUDE_FROM_ALL)
+FetchContent_MakeAvailable(nanobind)
 
 # 2. Convert Metal Shader to C++ Header for JIT
 set(METAL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/mlx_ternary/cpp/ternary.metal")
@@ -40,8 +48,11 @@ add_custom_command(
     COMMENT "Generating C++ header from Metal shader..."
 )
 
-# 3. Compile our Python extension
-pybind11_add_module(mlx_ternary_ext 
+# 3. Compile our Python extension using nanobind
+nanobind_add_module(mlx_ternary_ext 
+    NB_STATIC
+    STABLE_ABI
+    NB_DOMAIN mlx
     src/mlx_ternary/cpp/extension.cpp
     src/mlx_ternary/cpp/TernaryOp.cpp
     ${METAL_HEADER} # Depend on the generated header
