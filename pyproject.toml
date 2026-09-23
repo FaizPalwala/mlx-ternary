@@ -16,3 +16,7 @@ dependencies = [
 dev = [
     "pytest",
 ]
+
+[tool.scikit-build]
+wheel.packages = ["src/mlx_ternary"]
+wheel.exclude = ["include", "lib", "share", "mlx_ternary_ext.*"]

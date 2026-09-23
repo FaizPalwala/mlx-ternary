@@ -52,3 +52,6 @@ target_include_directories(mlx_ternary_ext PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(mlx_ternary_ext PRIVATE mlx)
 
 target_compile_definitions(mlx_ternary_ext PRIVATE VERSION_INFO=${PROJECT_VERSION})
+
+# 4. Install the extension into the python package
+install(TARGETS mlx_ternary_ext DESTINATION mlx_ternary)
