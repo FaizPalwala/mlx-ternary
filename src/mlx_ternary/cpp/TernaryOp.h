@@ -4,27 +4,26 @@
 
 namespace mlx_ternary {
 
-class TernaryMatMul : public mlx::core::CustomOp {
+class TernaryMatMul : public mlx::core::Primitive {
 public:
-    // Constructor. For now, we take no extra parameters, but we might need
-    // group_size, bits_per_weight, etc. later.
-    TernaryMatMul();
+    explicit TernaryMatMul(mlx::core::Stream stream)
+        : mlx::core::Primitive(stream) {}
 
-    // Standard MLX CustomOp interface overrides
-    std::unique_ptr<mlx::core::CustomOp> clone() const override;
-    
-    std::vector<mlx::core::array> eval_cpu(
+    void eval_cpu(
         const std::vector<mlx::core::array>& inputs,
-        const std::vector<mlx::core::array>& outputs) override;
+        std::vector<mlx::core::array>& outputs) override;
 
-    std::vector<mlx::core::array> eval_gpu(
+    void eval_gpu(
         const std::vector<mlx::core::array>& inputs,
-        const std::vector<mlx::core::array>& outputs) override;
+        std::vector<mlx::core::array>& outputs) override;
 
-    std::string name() const override { return "TernaryMatMul"; }
+    void print(std::ostream& os) const override { os << "TernaryMatMul"; }
+    bool is_equivalent(const mlx::core::Primitive& other) const override {
+        return typeid(*this) == typeid(other);
+    }
 };
 
 // Expose a factory function to easily create the op in Python bindings
-mlx::core::array ternary_matmul(const mlx::core::array& x, const mlx::core::array& w);
+mlx::core::array ternary_matmul(const mlx::core::array& x, const mlx::core::array& w_packed, const mlx::core::array& scales, mlx::core::StreamOrDevice s = {});
 
 } // namespace mlx_ternary
