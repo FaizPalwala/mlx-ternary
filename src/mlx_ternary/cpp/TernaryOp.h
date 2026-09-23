@@ -19,7 +19,6 @@ public:
         std::vector<mlx::core::array>& outputs) override;
 
     void print(std::ostream& os) override { os << "TernaryMatMul"; }
-    const char* name() const override { return "TernaryMatMul"; }
     bool is_equivalent(const mlx::core::Primitive& other) const override {
         return typeid(*this) == typeid(other);
     }
