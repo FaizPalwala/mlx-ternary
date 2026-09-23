@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mlx/mlx.h>
+#include <mlx/primitives.h>
 
 namespace mlx_ternary {
 
