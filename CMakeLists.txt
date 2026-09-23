@@ -3,36 +3,24 @@ project(mlx_ternary LANGUAGES CXX)
 
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
-
-# 1. Fetch MLX from source
-# We lock to a specific tag to prevent upstream breaks.
-FetchContent_Declare(
-  mlx
-  GIT_REPOSITORY https://github.com/ml-explore/mlx.git
-  GIT_TAG        v0.16.0
-)
-
-# Disable unnecessary MLX targets (tests, examples, bindings) to speed up build
-# and fix old CMake compatibility issues with doctest
-set(BUILD_TESTS OFF CACHE BOOL "Disable MLX tests" FORCE)
-set(BUILD_EXAMPLES OFF CACHE BOOL "Disable MLX examples" FORCE)
-set(BUILD_PYTHON_BINDINGS OFF CACHE BOOL "Disable MLX python" FORCE)
-set(MLX_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "Disable MLX python" FORCE)
-
-# This will pull down MLX and make its targets available (e.g., `mlx`)
-FetchContent_MakeAvailable(mlx)
-
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+
+# Find MLX from the pip installation
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -m mlx --cmake-dir
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  OUTPUT_VARIABLE MLX_ROOT)
+find_package(MLX CONFIG REQUIRED)
 
 # Fetch nanobind instead of pybind11
 FetchContent_Declare(
   nanobind
   GIT_REPOSITORY https://github.com/wjakob/nanobind.git
-  GIT_TAG v2.1.0  # Stable nanobind version
+  GIT_TAG v3.0.1
   GIT_SHALLOW TRUE
   EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(nanobind)
