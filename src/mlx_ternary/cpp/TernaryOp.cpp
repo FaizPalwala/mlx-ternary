@@ -27,7 +27,7 @@ mlx::core::array ternary_matmul(
     }
     
     // Output shape calculation: standard matmul rules
-    std::vector<int> out_shape = x.shape();
+    auto out_shape = x.shape();
     out_shape.back() = w_packed.shape().back(); // x: (..., M, K), w: (K/4, N) -> out: (..., M, N)
 
     auto stream = mlx::core::to_stream(s);
