@@ -25,6 +25,6 @@ public:
 };
 
 // Expose a factory function to easily create the op in Python bindings
-mlx::core::array ternary_matmul(const mlx::core::array& x, const mlx::core::array& w_packed, const mlx::core::array& scales, mlx::core::StreamOrDevice s = {});
+mlx::core::array ternary_matmul(const mlx::core::array& x, const mlx::core::array& w_packed, const mlx::core::array& scales);
 
 } // namespace mlx_ternary

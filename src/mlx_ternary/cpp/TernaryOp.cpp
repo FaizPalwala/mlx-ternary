@@ -72,13 +72,19 @@ void TernaryMatMul::eval_gpu(
 mlx::core::array ternary_matmul(
     const mlx::core::array& x,
     const mlx::core::array& w_packed,
-    const mlx::core::array& scales,
-    mlx::core::StreamOrDevice s
+    const mlx::core::array& scales
 ) {
+    auto s = mlx::core::default_stream(mlx::core::default_device());
     // Input validation
     if (x.ndim() < 2 || w_packed.ndim() < 2) {
         throw std::invalid_argument("[mlx_ternary] Inputs must be at least 2D.");
     }
+
+    // IMPORTANT: Metal kernels expect linearly contiguous memory. 
+    // Python reshape/slice ops often produce non-contiguous arrays with strides.
+    auto x_c = mlx::core::contiguous(x, false, s);
+    auto w_c = mlx::core::contiguous(w_packed, false, s);
+    auto scales_c = mlx::core::contiguous(scales, false, s);
     
     // Output shape calculation: standard matmul rules
     auto out_shape = x.shape();
@@ -94,7 +100,7 @@ mlx::core::array ternary_matmul(
         out_shape, 
         x.dtype(),
         op,
-        {x, w_packed, scales}
+        {x_c, w_c, scales_c}
     );
 }
 
