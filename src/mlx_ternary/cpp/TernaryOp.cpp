@@ -80,15 +80,24 @@ mlx::core::array ternary_matmul(
         throw std::invalid_argument("[mlx_ternary] Inputs must be at least 2D.");
     }
 
+    uint K = x.shape().back();
+    uint pad_K = (5 - (K % 5)) % 5;
+    
+    mlx::core::array x_padded = x;
+    if (pad_K > 0) {
+        std::vector<std::pair<int, int>> pad_widths(x.ndim(), {0, 0});
+        pad_widths.back() = {0, pad_K};
+        x_padded = mlx::core::pad(x, pad_widths, mlx::core::array(0.0f, x.dtype()), s);
+    }
+
     // IMPORTANT: Metal kernels expect linearly contiguous memory. 
-    // Python reshape/slice ops often produce non-contiguous arrays with strides.
-    auto x_c = mlx::core::contiguous(x, false, s);
+    auto x_c = mlx::core::contiguous(x_padded, false, s);
     auto w_c = mlx::core::contiguous(w_packed, false, s);
     auto scales_c = mlx::core::contiguous(scales, false, s);
     
-    // Output shape calculation: standard matmul rules
+    // Output shape calculation
     auto out_shape = x.shape();
-    out_shape.back() = w_packed.shape().back(); // x: (..., M, K), w: (K/4, N) -> out: (..., M, N)
+    out_shape.back() = w_packed.shape().back(); 
 
     auto stream = mlx::core::to_stream(s);
 

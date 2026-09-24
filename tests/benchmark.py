@@ -5,7 +5,7 @@ from tests.test_ops import pack_ternary_weights
 
 def benchmark_matmul():
     # Large dimensions typical for an LLM
-    B, M, K, N = 1, 512, 4096, 4096
+    B, M, K, N = 1, 1, 4096, 4096
     
     print(f"Benchmarking Matrix Multiplication (M={M}, K={K}, N={N})")
     print("-" * 50)

@@ -18,9 +18,11 @@ using namespace metal;
  * =====================================================================
  */
 
+#include "base3_lut.h"
+
 kernel void ternary_matmul_kernel(
     device const float16_t* activations [[buffer(0)]], // shape: (M, K)
-    device const uint8_t* packed_weights [[buffer(1)]], // shape: (K/4, N) - 4 weights per byte
+    device const uint8_t* packed_weights [[buffer(1)]], // shape: (K/5, N) - 5 weights per byte (Base-3)
     device const float16_t* scales [[buffer(2)]], // shape: (N) - scaling factor for each column
     device float16_t* output [[buffer(3)]], // shape: (M, N)
     constant uint& M [[buffer(4)]],
@@ -31,7 +33,6 @@ kernel void ternary_matmul_kernel(
     uint row = gid.y; // M dimension
     
     // We vectorize across N. Each thread processes 16 columns.
-    // gid.x is the thread index in the grid.
     uint vec_col = gid.x; 
     
     if (row >= M || vec_col * 16 >= N) {
@@ -45,16 +46,16 @@ kernel void ternary_matmul_kernel(
     device const uint4* w_vec = (device const uint4*)packed_weights;
     uint N_vec = N / 16; 
 
-    // Loop over K in blocks of 4 (since 1 byte = 4 weights down the K dimension)
-    uint K_blocks = K / 4;
+    // Loop over K in blocks of 5 (1 byte = 5 weights)
+    uint K_blocks = K / 5;
     for (uint k = 0; k < K_blocks; k++) {
-        // Read 4 activations (shared across all columns)
-        // The L1 cache will broadcast this to all threads in the SIMD group
-        uint x_idx = row * K + k * 4;
+        // Read 5 activations
+        uint x_idx = row * K + k * 5;
         float16_t x0 = activations[x_idx + 0];
         float16_t x1 = activations[x_idx + 1];
         float16_t x2 = activations[x_idx + 2];
         float16_t x3 = activations[x_idx + 3];
+        float16_t x4 = activations[x_idx + 4];
 
         // Read 16 bytes of weights (1 byte per column)
         uint4 w_bytes_uint4 = w_vec[k * N_vec + vec_col];
@@ -64,19 +65,14 @@ kernel void ternary_matmul_kernel(
         for (uint c = 0; c < 16; c++) {
             uint8_t b = bytes[c];
             
-            // Extract 2-bit values
-            uint8_t v0 = b & 0x3;
-            uint8_t v1 = (b >> 2) & 0x3;
-            uint8_t v2 = (b >> 4) & 0x3;
-            uint8_t v3 = (b >> 6) & 0x3;
+            // Decompress 5 weights instantly via constant LUT
+            float16_t w0 = base3_lut[b][0];
+            float16_t w1 = base3_lut[b][1];
+            float16_t w2 = base3_lut[b][2];
+            float16_t w3 = base3_lut[b][3];
+            float16_t w4 = base3_lut[b][4];
 
-            // Map to float16: 0->0.0, 1->1.0, 2->-1.0
-            float16_t w0 = (v0 == 0) ? 0.0h : ((v0 == 1) ? 1.0h : -1.0h);
-            float16_t w1 = (v1 == 0) ? 0.0h : ((v1 == 1) ? 1.0h : -1.0h);
-            float16_t w2 = (v2 == 0) ? 0.0h : ((v2 == 1) ? 1.0h : -1.0h);
-            float16_t w3 = (v3 == 0) ? 0.0h : ((v3 == 1) ? 1.0h : -1.0h);
-
-            acc[c] += x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3;
+            acc[c] += x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3 + x4 * w4;
         }
     }
 

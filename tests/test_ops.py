@@ -4,26 +4,32 @@ import pytest
 
 def pack_ternary_weights(w: mx.array) -> mx.array:
     """
-    Simulates the 2-bit packing of ternary weights {-1, 0, 1} -> {2, 0, 1}
-    Four weights are packed into a single uint8.
+    Packs 5 ternary weights {-1, 0, 1} into a single byte using Base-3 encoding.
+    This achieves 1.6 bits per weight (3^5 = 243 <= 256).
     """
-    # Map weights: 1 -> 1, -1 -> 2, 0 -> 0
-    w_mapped = mx.where(w == 1, 1, mx.where(w == -1, 2, 0)).astype(mx.uint8)
-    
     K, N = w.shape
-    assert K % 4 == 0, "K must be divisible by 4 for packing"
+    pad_K = (5 - (K % 5)) % 5
     
-    # Reshape to (K//4, 4, N)
-    w_reshaped = w_mapped.reshape(K // 4, 4, N)
+    if pad_K > 0:
+        w = mx.concatenate([w, mx.zeros((pad_K, N))], axis=0)
     
-    # Pack 4 values into 1 byte (little endian bit order based on our kernel unpack logic)
-    # unpack_ternary logic: (packed >> (index * 2)) & 0x3
+    K_padded = w.shape[0]
+    
+    # Map weights: 0 -> 0, 1 -> 1, -1 -> 2
+    w_mapped = mx.where(w == 1, 1, mx.where(w == -1, 2, 0)).astype(mx.uint16)
+    
+    # Reshape to groups of 5
+    w_reshaped = w_mapped.reshape(K_padded // 5, 5, N)
+    
+    # Base-3 packing: w0 + w1*3 + w2*9 + w3*27 + w4*81
     w_packed = (
-        (w_reshaped[:, 0, :] << 0) |
-        (w_reshaped[:, 1, :] << 2) |
-        (w_reshaped[:, 2, :] << 4) |
-        (w_reshaped[:, 3, :] << 6)
-    )
+        w_reshaped[:, 0, :] * 1 +
+        w_reshaped[:, 1, :] * 3 +
+        w_reshaped[:, 2, :] * 9 +
+        w_reshaped[:, 3, :] * 27 +
+        w_reshaped[:, 4, :] * 81
+    ).astype(mx.uint8)
+    
     return w_packed
 
 def test_ternary_matmul_equivalence():
