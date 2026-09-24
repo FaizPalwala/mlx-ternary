@@ -20,17 +20,14 @@ void TernaryMatMul::eval_gpu(
     
 #ifdef _METAL_
     auto& x = inputs[0];
-    auto& w_packed = inputs[1];
-    auto& scales = inputs[2];
+    auto& w_interleaved = inputs[1]; // (K_blocks, N, 32) uint8_t
     auto& out = outputs[0];
 
-    // Allocate output
     out.set_data(mlx::core::allocator::malloc(out.nbytes()));
 
     auto& s = stream();
     auto& d = mlx::core::metal::device(s.device);
 
-    // JIT compile the metal shader from the auto-generated string header
     auto lib = d.get_library("mlx_ternary", [&]() {
         return std::string(ternary_metal_source);
     });
@@ -40,23 +37,20 @@ void TernaryMatMul::eval_gpu(
     auto& compute_encoder = mlx::core::metal::get_command_encoder(s);
     compute_encoder.set_compute_pipeline_state(kernel);
 
-    // Dimensions
     uint M = 1;
     for (int i = 0; i < x.ndim() - 1; ++i) M *= x.shape(i);
     uint K = x.shape().back();
-    uint N = w_packed.shape().back();
+    uint N = w_interleaved.shape(1);
 
     compute_encoder.set_input_array(x, 0);
-    compute_encoder.set_input_array(w_packed, 1);
-    compute_encoder.set_input_array(scales, 2);
-    compute_encoder.set_output_array(out, 3);
+    compute_encoder.set_input_array(w_interleaved, 1);
+    compute_encoder.set_output_array(out, 2);
 
-    compute_encoder.set_bytes(M, 4);
-    compute_encoder.set_bytes(K, 5);
-    compute_encoder.set_bytes(N, 6);
+    compute_encoder.set_bytes(M, 3);
+    compute_encoder.set_bytes(K, 4);
+    compute_encoder.set_bytes(N, 5);
 
-    uint N_vec = (N + 15) / 16;
-    MTL::Size grid_dims = MTL::Size(32, N_vec, M);
+    MTL::Size grid_dims = MTL::Size(32, N, M);
     MTL::Size group_dims = MTL::Size(32, 1, 1);
 
     compute_encoder.dispatch_threads(grid_dims, group_dims);
@@ -67,17 +61,15 @@ void TernaryMatMul::eval_gpu(
 
 mlx::core::array ternary_matmul(
     const mlx::core::array& x,
-    const mlx::core::array& w_packed,
-    const mlx::core::array& scales
+    const mlx::core::array& w_interleaved
 ) {
     auto s = mlx::core::default_stream(mlx::core::default_device());
-    // Input validation
-    if (x.ndim() < 2 || w_packed.ndim() < 2) {
-        throw std::invalid_argument("[mlx_ternary] Inputs must be at least 2D.");
+    if (x.ndim() < 2 || w_interleaved.ndim() < 3) {
+        throw std::invalid_argument("[mlx_ternary] Inputs must be appropriately sized.");
     }
 
     uint K = x.shape().back();
-    uint pad_K = (5 - (K % 5)) % 5;
+    uint pad_K = (150 - (K % 150)) % 150;
     
     mlx::core::array x_padded = x;
     if (pad_K > 0) {
@@ -86,26 +78,20 @@ mlx::core::array ternary_matmul(
         x_padded = mlx::core::pad(x, pad_widths, mlx::core::array(0.0f, x.dtype()), "constant", s);
     }
 
-    // IMPORTANT: Metal kernels expect linearly contiguous memory. 
     auto x_c = mlx::core::contiguous(x_padded, false, s);
-    auto w_c = mlx::core::contiguous(w_packed, false, s);
-    auto scales_c = mlx::core::contiguous(scales, false, s);
+    auto w_c = mlx::core::contiguous(w_interleaved, false, s);
     
-    // Output shape calculation
     auto out_shape = x.shape();
-    out_shape.back() = w_packed.shape().back(); 
+    out_shape.back() = w_interleaved.shape(1); // N
 
     auto stream = mlx::core::to_stream(s);
-
-    // Instantiate our custom op
     auto op = std::make_shared<TernaryMatMul>(stream);
     
-    // Insert into MLX graph
     return mlx::core::array(
         out_shape, 
         x.dtype(),
         op,
-        {x_c, w_c, scales_c}
+        {x_c, w_c}
     );
 }
 
