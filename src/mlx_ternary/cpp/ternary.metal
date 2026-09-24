@@ -22,34 +22,34 @@ using namespace metal;
 
 kernel void ternary_matmul_kernel(
     device const float16_t* activations [[buffer(0)]], // shape: (M, K)
-    device const uint8_t* packed_weights [[buffer(1)]], // shape: (K/5, N) - 5 weights per byte (Base-3)
-    device const float16_t* scales [[buffer(2)]], // shape: (N) - scaling factor for each column
+    device const uint8_t* packed_weights [[buffer(1)]], // shape: (K/5, N)
+    device const float16_t* scales [[buffer(2)]], // shape: (N)
     device float16_t* output [[buffer(3)]], // shape: (M, N)
     constant uint& M [[buffer(4)]],
     constant uint& K [[buffer(5)]],
     constant uint& N [[buffer(6)]],
-    uint2 gid [[thread_position_in_grid]]
+    uint3 gid [[thread_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]]
 ) {
-    uint row = gid.y; // M dimension
+    uint lane_id = gid.x;      // 0..31 (SIMD lane)
+    uint vec_col = gid.y;      // 0..N/16 - 1
+    uint row = gid.z;          // 0..M - 1
     
-    // We vectorize across N. Each thread processes 16 columns.
-    uint vec_col = gid.x; 
-    
-    if (row >= M || vec_col * 16 >= N) {
+    if (row >= M || vec_col * 16 >= N || lane_id >= 32) {
         return;
     }
 
-    // Accumulators for 16 columns
     float16_t acc[16] = {0};
 
-    // Cast weights to uint4 (128-bit) for max bus saturation
     device const uint4* w_vec = (device const uint4*)packed_weights;
     uint N_vec = N / 16; 
 
-    // Loop over K in blocks of 5 (1 byte = 5 weights)
     uint K_blocks = K / 5;
-    for (uint k = 0; k < K_blocks; k++) {
-        // Read 5 activations
+    uint blocks_per_thread = (K_blocks + 31) / 32;
+    uint start_k = lane_id * blocks_per_thread;
+    uint end_k = min(start_k + blocks_per_thread, K_blocks);
+
+    for (uint k = start_k; k < end_k; k++) {
         uint x_idx = row * K + k * 5;
         float16_t x0 = activations[x_idx + 0];
         float16_t x1 = activations[x_idx + 1];
@@ -57,16 +57,12 @@ kernel void ternary_matmul_kernel(
         float16_t x3 = activations[x_idx + 3];
         float16_t x4 = activations[x_idx + 4];
 
-        // Read 16 bytes of weights (1 byte per column)
         uint4 w_bytes_uint4 = w_vec[k * N_vec + vec_col];
 
-        // Process all 16 columns
         for (uint c = 0; c < 16; c++) {
-            // Safely extract the c-th byte from the uint4 vector without pointer aliasing
             uint chunk = w_bytes_uint4[c / 4];
             uint8_t b = (chunk >> ((c % 4) * 8)) & 0xFF;
             
-            // Decompress 5 weights instantly via constant LUT
             float16_t w0 = base3_lut[b][0];
             float16_t w1 = base3_lut[b][1];
             float16_t w2 = base3_lut[b][2];
@@ -77,11 +73,16 @@ kernel void ternary_matmul_kernel(
         }
     }
 
-    // Apply scaling and write out 16 elements
+    // SIMD reduce across the 32 threads in the threadgroup
     for (uint c = 0; c < 16; c++) {
-        uint actual_col = vec_col * 16 + c;
-        if (actual_col < N) {
-            output[row * N + actual_col] = acc[c] * scales[actual_col];
+        float16_t total = simd_sum(acc[c]);
+        
+        // Only thread 0 writes the reduced output to global memory
+        if (lane_id == 0) {
+            uint actual_col = vec_col * 16 + c;
+            if (actual_col < N) {
+                output[row * N + actual_col] = total * scales[actual_col];
+            }
         }
     }
 }

@@ -39,7 +39,7 @@ def benchmark_matmul():
         
     # Benchmark Standard
     iters = 100
-    mx.metal.clear_cache()
+    # mx.metal.clear_cache()
     
     start_time = time.perf_counter()
     for _ in range(iters):
@@ -48,7 +48,7 @@ def benchmark_matmul():
     std_time = (time.perf_counter() - start_time) / iters
     
     # Benchmark Custom
-    mx.metal.clear_cache()
+    # mx.metal.clear_cache()
     start_time = time.perf_counter()
     for _ in range(iters):
         y_cust = custom_ternary_matmul(x, w_packed, scales)

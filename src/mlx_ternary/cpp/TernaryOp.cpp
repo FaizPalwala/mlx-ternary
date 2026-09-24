@@ -55,13 +55,9 @@ void TernaryMatMul::eval_gpu(
     compute_encoder.set_bytes(K, 5);
     compute_encoder.set_bytes(N, 6);
 
-    MTL::Size grid_dims = MTL::Size(N, M, 1);
-    
-    // Ensure threadgroups are well balanced
-    NS::UInteger max_threads = kernel->maxTotalThreadsPerThreadgroup();
-    NS::UInteger max_x = std::min<NS::UInteger>(N, max_threads);
-    NS::UInteger max_y = std::min<NS::UInteger>(M, max_threads / max_x);
-    MTL::Size group_dims = MTL::Size(max_x, max_y, 1);
+    uint N_vec = (N + 15) / 16;
+    MTL::Size grid_dims = MTL::Size(32, N_vec, M);
+    MTL::Size group_dims = MTL::Size(32, 1, 1);
 
     compute_encoder.dispatch_threads(grid_dims, group_dims);
 #else

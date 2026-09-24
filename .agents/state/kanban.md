@@ -5,9 +5,14 @@
 - [ ] Finalize testing strategy and CI/CD
 
 ## 🛠️ In Progress
-- [ ] Investigate BitNet b1.58 kernel optimizations (Tiling, SIMD groups, avoiding AMX bottlenecks).
+- [ ] Profile memory bandwidth utilization and write Threadgroup Block-Tiling to reach >200 GB/s on the M4 Pro.
+- [ ] Expose `quantize()` API in Python to convert HuggingFace models into our custom format.
 
 ## ✅ Done
+- [x] **Milestone 2**: Implemented 1.6-bit Base-3 packing in Python.
+- [x] **Milestone 2**: Added Constant-Memory Decompression LUT to Metal kernel to eliminate ALU modulo math.
+- [x] **Milestone 2**: Resolved Metal UB (Undefined Behavior) during `uint4` memory aliasing.
+- [x] **Milestone 1**: Rewrote `ternary.metal` kernel to stream weights using `uint4` (128-bit) vectorized loads.
 - [x] Profile performance and write benchmark scripts (Achieved baseline metrics).
 - [x] Write pytest suite for verifying outputs against standard matmul (Equivalence matched!)
 - [x] Resolve Nanobind cross-module RTTI bridging issue (Pinned v2.10.2).
