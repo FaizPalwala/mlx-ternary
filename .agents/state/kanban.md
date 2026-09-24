@@ -1,13 +1,14 @@
 # Kanban Board
 
 ## 📋 Backlog
+- [ ] Implement end-to-end small model (e.g. Llama/Mistral) using TernaryLinear.
 - [ ] Finalize testing strategy and CI/CD
 
 ## 🛠️ In Progress
-- [ ] Profile performance and write benchmark scripts
-- [ ] Investigate BitNet b1.58 kernel optimizations (fusing scaling, avoiding branches)
+- [ ] Investigate BitNet b1.58 kernel optimizations (Tiling, SIMD groups, avoiding AMX bottlenecks).
 
 ## ✅ Done
+- [x] Profile performance and write benchmark scripts (Achieved baseline metrics).
 - [x] Write pytest suite for verifying outputs against standard matmul (Equivalence matched!)
 - [x] Resolve Nanobind cross-module RTTI bridging issue (Pinned v2.10.2).
 - [x] Enforce memory contiguity for Metal kernels.

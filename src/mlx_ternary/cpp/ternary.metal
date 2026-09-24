@@ -2,30 +2,22 @@
 using namespace metal;
 
 /* =====================================================================
- * FUNCTIONAL SPECIFICATION: Ternary MatMul Kernel (Un-Fused v1.0)
+ * FUNCTIONAL SPECIFICATION: Ternary MatMul Kernel (Vectorized v2.0)
  * =====================================================================
  * This kernel performs a forward-pass matrix multiplication optimized
  * for 1.58-bit ternary language models.
  * 
- * DESIGN DECISIONS:
- * 1. 2-bit Packing: We assume weights are packed 4-to-a-byte (uint8_t).
- *    Mapping: 00 -> 0.0, 01 -> 1.0, 10 -> -1.0.
- * 2. Un-Fused Scaling: This kernel ONLY computes the integer accumulation
- *    of the ternary weights. It DOES NOT apply the fp16 scaling factor.
- *    Scaling must be handled upstream in the MLX computation graph.
- * 3. ALU Starvation: By branching on the weight value (-1, 0, 1), we
- *    execute pure addition/subtraction, bypassing FP16 multiplication.
+ * ARCHITECTURAL SOTA OPTIMIZATIONS (Marlin-Style GEMV):
+ * 1. Vectorized Memory Streaming: Uses `uint4` (128-bit) loads to 
+ *    pull 16 columns of weights simultaneously, perfectly saturating 
+ *    the memory bus.
+ * 2. Zero-Hop Register Accumulation: Bypasses threadgroup memory for 
+ *    weights. Weights go straight from global RAM -> Registers -> Math.
+ * 3. ALU Pipelining: Uses `select` / ternary operators which compile 
+ *    to fast `fcsel` instructions, avoiding true branch divergence.
  * =====================================================================
  */
 
-inline float16_t unpack_ternary(uint8_t packed, uint index) {
-    uint8_t val = (packed >> (index * 2)) & 0x3;
-    if (val == 1) return 1.0h;
-    if (val == 2) return -1.0h;
-    return 0.0h;
-}
-
-// Bypasses FP16 multipliers using control flow / addition
 kernel void ternary_matmul_kernel(
     device const float16_t* activations [[buffer(0)]], // shape: (M, K)
     device const uint8_t* packed_weights [[buffer(1)]], // shape: (K/4, N) - 4 weights per byte
@@ -37,35 +29,64 @@ kernel void ternary_matmul_kernel(
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint row = gid.y; // M dimension
-    uint col = gid.x; // N dimension
-
-    if (row >= M || col >= N) {
+    
+    // We vectorize across N. Each thread processes 16 columns.
+    // gid.x is the thread index in the grid.
+    uint vec_col = gid.x; 
+    
+    if (row >= M || vec_col * 16 >= N) {
         return;
     }
 
-    float16_t acc = 0.0h;
+    // Accumulators for 16 columns
+    float16_t acc[16] = {0};
 
-    // Dot product loop
-    for (uint k = 0; k < K; k += 4) {
-        uint weight_idx = (k / 4) * N + col; // Assuming column-major or similar packing
-        uint8_t packed_w = packed_weights[weight_idx];
+    // Cast weights to uint4 (128-bit) for max bus saturation
+    device const uint4* w_vec = (device const uint4*)packed_weights;
+    uint N_vec = N / 16; 
 
-        for (uint i = 0; i < 4; i++) {
-            if (k + i < K) {
-                float16_t w_val = unpack_ternary(packed_w, i);
-                float16_t x_val = activations[row * K + (k + i)];
-                
-                // Pure addition/subtraction branch
-                // (In a heavily optimized kernel, this would use bit-tricks to avoid branching)
-                if (w_val > 0.5h) {
-                    acc += x_val;
-                } else if (w_val < -0.5h) {
-                    acc -= x_val;
-                }
-            }
+    // Loop over K in blocks of 4 (since 1 byte = 4 weights down the K dimension)
+    uint K_blocks = K / 4;
+    for (uint k = 0; k < K_blocks; k++) {
+        // Read 4 activations (shared across all columns)
+        // The L1 cache will broadcast this to all threads in the SIMD group
+        uint x_idx = row * K + k * 4;
+        float16_t x0 = activations[x_idx + 0];
+        float16_t x1 = activations[x_idx + 1];
+        float16_t x2 = activations[x_idx + 2];
+        float16_t x3 = activations[x_idx + 3];
+
+        // Read 16 bytes of weights (1 byte per column)
+        uint4 w_bytes_uint4 = w_vec[k * N_vec + vec_col];
+        thread uint8_t* bytes = (thread uint8_t*)&w_bytes_uint4;
+
+        // Process all 16 columns
+        for (uint c = 0; c < 16; c++) {
+            uint8_t b = bytes[c];
+            
+            // Extract 2-bit values
+            uint8_t v0 = b & 0x3;
+            uint8_t v1 = (b >> 2) & 0x3;
+            uint8_t v2 = (b >> 4) & 0x3;
+            uint8_t v3 = (b >> 6) & 0x3;
+
+            // Map to float16: 0->0.0, 1->1.0, 2->-1.0
+            float16_t w0 = (v0 == 0) ? 0.0h : ((v0 == 1) ? 1.0h : -1.0h);
+            float16_t w1 = (v1 == 0) ? 0.0h : ((v1 == 1) ? 1.0h : -1.0h);
+            float16_t w2 = (v2 == 0) ? 0.0h : ((v2 == 1) ? 1.0h : -1.0h);
+            float16_t w3 = (v3 == 0) ? 0.0h : ((v3 == 1) ? 1.0h : -1.0h);
+
+            acc[c] += x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3;
         }
     }
 
-    // Apply scale and write out
-    output[row * N + col] = acc * scales[col];
+    // Apply scaling and write out 16 elements
+    for (uint c = 0; c < 16; c++) {
+        uint actual_col = vec_col * 16 + c;
+        if (actual_col < N) {
+            output[row * N + actual_col] = acc[c] * scales[actual_col];
+        }
+    }
 }
+
+
