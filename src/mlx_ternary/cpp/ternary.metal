@@ -59,11 +59,12 @@ kernel void ternary_matmul_kernel(
 
         // Read 16 bytes of weights (1 byte per column)
         uint4 w_bytes_uint4 = w_vec[k * N_vec + vec_col];
-        thread uint8_t* bytes = (thread uint8_t*)&w_bytes_uint4;
 
         // Process all 16 columns
         for (uint c = 0; c < 16; c++) {
-            uint8_t b = bytes[c];
+            // Safely extract the c-th byte from the uint4 vector without pointer aliasing
+            uint chunk = w_bytes_uint4[c / 4];
+            uint8_t b = (chunk >> ((c % 4) * 8)) & 0xFF;
             
             // Decompress 5 weights instantly via constant LUT
             float16_t w0 = base3_lut[b][0];

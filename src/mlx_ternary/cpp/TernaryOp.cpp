@@ -87,7 +87,7 @@ mlx::core::array ternary_matmul(
     if (pad_K > 0) {
         std::vector<std::pair<int, int>> pad_widths(x.ndim(), {0, 0});
         pad_widths.back() = {0, pad_K};
-        x_padded = mlx::core::pad(x, pad_widths, mlx::core::array(0.0f, x.dtype()), s);
+        x_padded = mlx::core::pad(x, pad_widths, mlx::core::array(0.0f, x.dtype()), "constant", s);
     }
 
     // IMPORTANT: Metal kernels expect linearly contiguous memory. 
