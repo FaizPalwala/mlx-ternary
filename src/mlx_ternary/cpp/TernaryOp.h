@@ -7,8 +7,10 @@ namespace mlx_ternary {
 
 class TernaryMatMul : public mlx::core::Primitive {
 public:
-    explicit TernaryMatMul(mlx::core::Stream stream)
-        : mlx::core::Primitive(stream) {}
+    uint32_t group_size_;
+    
+    explicit TernaryMatMul(mlx::core::Stream stream, uint32_t group_size)
+        : mlx::core::Primitive(stream), group_size_(group_size) {}
 
     void eval_cpu(
         const std::vector<mlx::core::array>& inputs,
@@ -20,11 +22,11 @@ public:
 
     const char* name() const override { return "TernaryMatMul"; }
     bool is_equivalent(const mlx::core::Primitive& other) const override {
-        return typeid(*this) == typeid(other);
+        const TernaryMatMul* o = dynamic_cast<const TernaryMatMul*>(&other);
+        return o && (group_size_ == o->group_size_);
     }
 };
 
-// Expose a factory function to easily create the op in Python bindings
-mlx::core::array ternary_matmul(const mlx::core::array& x, const mlx::core::array& w_interleaved);
+mlx::core::array ternary_matmul(const mlx::core::array& x, const mlx::core::array& w_interleaved, uint32_t group_size);
 
 } // namespace mlx_ternary
