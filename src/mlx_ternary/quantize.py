@@ -1,5 +1,4 @@
 import mlx.core as mx
-import numpy as np
 
 def pack_interleaved(w_raw, group_size=150):
     assert group_size in [128, 150], "Hardware Metal kernel currently requires group_size=128 or 150"
@@ -36,8 +35,7 @@ def pack_interleaved(w_raw, group_size=150):
     for i in range(5):
         w_packed = w_packed + (w_shifted[:, i::5, :] * (3 ** i)).astype(mx.uint8)
         
-    scales_np = np.array(scales, copy=False)
-    scales_uint8 = mx.array(np.frombuffer(scales_np, dtype=np.uint8)).reshape(blocks, N, 2)
+    scales_uint8 = scales.view(mx.uint8).reshape(blocks, N, 2)
     
     w_packed_transposed = mx.transpose(w_packed, (0, 2, 1)) # (blocks, N, num_bytes)
     

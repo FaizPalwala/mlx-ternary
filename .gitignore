@@ -33,3 +33,11 @@ cmake_install.cmake
 .vscode/
 *.swp
 .venv/
+.DS_Store
+
+
+# Weights and Datasets
+models/
+.cache/
+*.safetensors
+*.gguf
