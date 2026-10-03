@@ -1,25 +1,44 @@
-# Building from Source
+# Installation & Building from Source
 
-## Prerequisites
+`mlx-ternary` is a **pure Python package with runtime JIT Metal shader compilation**. 
 
-- **macOS** (Apple Silicon M1/M2/M3/M4 required for Metal acceleration)
-- **CMake** `>= 3.24`
-- **Python** `>= 3.9`
+Unlike older C++ extension architectures, **no C++ compilers, CMake, or nanobind toolchains are required**.
 
-## Build Instructions
+---
 
-`mlx_ternary` relies on `scikit-build-core` and fetches Apple's `mlx` library directly from source to ensure stable C++ linkage.
+## 1. Prerequisites
+
+- **macOS:** macOS Sonoma (14.0+) or Sequoia (15.0+)
+- **Hardware:** Apple Silicon (M1, M2, M3, M4, M5 or later)
+- **Python:** Python 3.9 through 3.12
+
+---
+
+## 2. Standard Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-repo/mlx-ternary.git
-cd mlx-ternary
-
-# Install via pip (this will trigger CMake and compile the C++ extension)
-pip install .
+pip install mlx-ternary
 ```
 
-### Metal Shader Compilation
+---
 
-We utilize **Just-In-Time (JIT)** compilation for our Metal shaders. 
-At build time, the CMake pipeline converts `ternary.metal` into a C++ string header. At runtime, MLX injects dimensional constants into the shader string and compiles it on the fly. This enables the Metal driver to aggressively unroll loops based on exact inference matrix shapes.
+## 3. Editable Installation (from Source)
+
+```bash
+git clone https://github.com/base3labs/mlx-ternary.git
+cd mlx-ternary
+pip install -e .
+```
+
+---
+
+## 4. Running Tests
+
+To verify that all Metal kernels compile and execute properly on your Apple Silicon GPU:
+
+```bash
+pip install pytest
+pytest tests/ -v
+```
+
+All unit tests should pass in under 1 second.

@@ -5,9 +5,13 @@ theme:
   features:
     - navigation.tabs
     - navigation.indexes
+    - content.code.copy
 
 nav:
-  - Home: index.md
-  - API Reference: api.md
+  - Overview: index.md
   - Architecture: architecture.md
-  - Building from Source: building.md
+  - API Reference: api.md
+  - Model Serving: serving.md
+  - Agentic Flows & KV Cache: agentic_flows.md
+  - Benchmarks: benchmarks.md
+  - Installation: building.md

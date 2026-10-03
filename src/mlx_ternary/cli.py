@@ -82,7 +82,16 @@ def download_and_transcode(repo_id: str):
     print("Transcoding complete!")
     return model_dir
 
-def serve(repo_id: str, speculate: bool = False, draft_model: str = None, host: str = "127.0.0.1", port: int = 8080):
+def serve(
+    repo_id: str,
+    speculate: bool = False,
+    draft_model: str = None,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    kv_bits: int = None,
+    kv_group_size: int = 64,
+    max_kv_size: int = None
+):
     from .server import run_server
     
     # If repo_id points to a local directory, use it directly
@@ -98,18 +107,29 @@ def serve(repo_id: str, speculate: bool = False, draft_model: str = None, host: 
         draft = draft_model if draft_model else DEFAULT_DRAFT_MODEL
         print(f"Speculative Decoding ENABLED. Draft model: {draft}")
 
-    run_server(model_dir=model_dir, host=host, port=port, draft_model=draft)
+    run_server(
+        model_dir=model_dir,
+        host=host,
+        port=port,
+        draft_model=draft,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        max_kv_size=max_kv_size
+    )
 
 def main():
     parser = argparse.ArgumentParser(prog="mlx_ternary")
     subparsers = parser.add_subparsers(dest="command")
     
     serve_parser = subparsers.add_parser("serve", help="Serve a model")
-    serve_parser.add_argument("repo_id", help="Hugging Face Repo ID")
+    serve_parser.add_argument("repo_id", help="Hugging Face Repo ID or local directory")
     serve_parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface (default: 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
     serve_parser.add_argument("--speculate", action="store_true", help="Enable speculative decoding with a default draft model.")
     serve_parser.add_argument("--draft", dest="draft_model", type=str, help="Specify a custom draft model for speculative decoding.")
+    serve_parser.add_argument("--kv-bits", type=int, choices=[4, 8, 16], default=None, help="KV cache quantization bits (4, 8, or 16/FP16)")
+    serve_parser.add_argument("--kv-group-size", type=int, default=64, help="KV cache quantization group size")
+    serve_parser.add_argument("--max-kv-size", type=int, default=None, help="Maximum KV cache size for rotating/sliding window")
     
     pack_parser = subparsers.add_parser("pack", help="Explicitly pack a model")
     pack_parser.add_argument("repo_id", help="Hugging Face Repo ID")
@@ -117,7 +137,16 @@ def main():
     args = parser.parse_args()
     
     if args.command == "serve":
-        serve(args.repo_id, args.speculate, args.draft_model, host=args.host, port=args.port)
+        serve(
+            args.repo_id,
+            args.speculate,
+            args.draft_model,
+            host=args.host,
+            port=args.port,
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            max_kv_size=args.max_kv_size
+        )
     elif args.command == "pack":
         download_and_transcode(args.repo_id)
     else:

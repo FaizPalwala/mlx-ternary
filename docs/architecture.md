@@ -1,30 +1,46 @@
-# Project Architecture: `mlx-ternary`
+# System Architecture: `mlx-ternary`
 
-## Mission
-Build a native, high-performance Apple Silicon runtime (C++/Metal kernels + Python bindings) specifically engineered for 1.58-bit ternary language models (like PrismML's Bonsai series). 
+`mlx-ternary` is a specialized inference runtime engineered specifically for 1.58-bit ternary language models on Apple Silicon.
 
-## Core Problem
-Ternary models use a **Hadamard-rotated weight basis** to spread outlier weights uniformly before quantization. Standard `mlx-lm` or Ollama loaders misinterpret these weights, outputting garbage. We are building the native infrastructure to parse these weights and execute them natively on Metal.
+---
 
-## Core Stack
-- **Languages:** C++, Metal (Shaders), Python.
-- **Frameworks:** Apple MLX, mlx-lm API compatibility.
+## 1. Core Technical Problem
 
-## System Boundaries
-- **What it IS:** A lightweight loader and custom inference kernel for Hadamard-rotated ternary matrices. It relies on a decoupled, pure C++ core logic layer that compiles custom Metal shaders.
-- **What it IS NOT:** A training library. A general-purpose Post-Training Quantization (PTQ) pipeline. 
+Ternary language models quantize neural network weights to the discrete set $\{-1, 0, +1\}$, achieving an information density of $\approx 1.58\text{ bits per parameter}$. 
 
-## Architectural Layers
-1. **C++ & Metal Core:** The foundational layer containing custom MLX ops (`mlx::core::Op`) and addition-only `.metal` kernels.
-2. **C-API:** Exposes the C++ core via Foreign Function Interface (FFI).
-3. **Language Bindings:**
-   - **Python:** For ML research, model conversion, and drop-in `mlx-lm` compatibility.
-   - **Swift:** For native iOS/macOS production deployment.
-   - **Rust/Go (Planned):** For backend agents and local LLM wrappers.
+To preserve reasoning capabilities, state-of-the-art models (such as Prism ML's Bonsai series) apply a **Fast Walsh-Hadamard Transform (FWHT)** to activations and weights, dispersing outlier feature magnitudes uniformly across channels.
 
-## API Contract (Python Example)
-```python
-import mlx_ternary
-model, tokenizer = mlx_ternary.load("PrismML/Bonsai-2-27B")
-response = mlx_ternary.generate(model, tokenizer, prompt="...")
-```
+Standard inference engines (like unpatched `llama.cpp` or default `mlx-lm`) cannot execute these checkpoints because:
+1. They lack the native Hadamard activation rotation steps.
+2. Standard 2-bit affine quantizers misinterpret Base-3 integer trits.
+3. Decompressing ternary weights with scalar math destroys memory bandwidth.
+
+---
+
+## 2. Architectural Pillars (ADR 002 Pivot)
+
+### A. Horizon 32-Byte Cacheline Interleaving
+Standard quantizers store scales and biases in separate tensor allocations, requiring two distinct DRAM memory requests per matrix tile. 
+
+`mlx-ternary` uses **Horizon Block Interleaving**:
+- Each group of 128 (or 150) weights is packed into a contiguous **32-byte memory block**.
+- The first **2 bytes** store the FP16 block scale (`float16_t`).
+- The remaining **30 bytes** store the Base-3 packed weight trits (5 trits per byte: $3^5 = 243 \le 256$).
+- Every weight request perfectly aligns with Apple Silicon's 128-byte L2/DRAM cachelines, achieving zero-stride sequential memory loads.
+
+### B. Hardware Vector ALU (`dot(half4, half4)`)
+In standard decode kernels, looking up 5 trits per byte and multiplying activations scalars produces 130 scalar memory lookups per group.
+
+In `mlx-ternary`:
+- Base-3 combinations are pre-mapped into constant GPU memory: `base3_lut_low[243]` (`constant half4`) and `base3_lut_high[243]` (`constant half`).
+- Activations are loaded as vector quadruplets (`half4`).
+- Multiplications execute using Apple Silicon's native **1-cycle vector dot product instruction**:
+  $$\text{block\_acc} += \text{dot}(x_{low}, w_{low}) + x_{high} \cdot w_{high}$$
+
+### C. Automated Dual-Dispatch: GEMV vs. AMX GEMM
+The runtime automatically switches execution strategies based on prompt sequence length $M$:
+- **Autoregressive Single-Token Decode ($M \le 16$):** Dispatches the vectorized coalesced GEMV kernel with **Split-K multi-slice reduction** for narrow projections (`Attention KV`).
+- **Prefill & Speculative Verification ($M > 16$):** Dispatches the AMX block GEMM kernel, utilizing Apple Silicon's `simdgroup_matrix<half, 8, 8>` and `simdgroup_multiply_accumulate` matrix hardware.
+
+### D. Pure Python Orchestration
+The entire engine compiles its Metal shaders Just-In-Time (JIT) using `mlx.core.fast.metal_kernel`. There are zero static C++ shared libraries, eliminating compilation issues across varying macOS versions.
