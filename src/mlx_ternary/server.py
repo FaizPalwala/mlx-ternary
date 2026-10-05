@@ -34,10 +34,12 @@ def setup_model_loader(model_path: Path, kv_bits: int = None, kv_group_size: int
                     model.make_cache = make_custom_cache
                     print(f"[mlx_ternary] Configured KV Cache: bits={kv_bits or 16}, group_size={kv_group_size}, max_kv_size={max_kv_size}")
 
-                tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(model_path / "tokenizer.json"))
+                from mlx_lm.tokenizer_utils import TokenizerWrapper
+                raw_tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(model_path / "tokenizer.json"))
                 chat_template_file = model_path / "chat_template.jinja"
                 if chat_template_file.exists():
-                    tokenizer.chat_template = chat_template_file.read_text()
+                    raw_tokenizer.chat_template = chat_template_file.read_text()
+                tokenizer = TokenizerWrapper(raw_tokenizer)
                 return model, tokenizer
 
             return custom_load
