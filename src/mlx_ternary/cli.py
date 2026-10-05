@@ -10,77 +10,88 @@ from .quantize import pack_interleaved
 CACHE_DIR = Path.home() / ".cache" / "mlx_ternary"
 DEFAULT_DRAFT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
-def download_and_transcode(repo_id: str):
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        raise ImportError(
-            "huggingface_hub is required to download models. Install via: pip install huggingface_hub"
-        )
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    
-    print(f"Checking for {repo_id}...")
-    model_dir = CACHE_DIR / repo_id.replace("/", "--")
-    
-    if not model_dir.exists():
-        print(f"Downloading {repo_id} from Hugging Face...")
-        snapshot_download(repo_id=repo_id, local_dir=str(model_dir))
-    
-    interleaved_path = model_dir / "model_interleaved.safetensors"
-    
-    if interleaved_path.exists():
+def download_and_transcode(repo_id: str, output_dir: str = None) -> Path:
+    local_path = Path(repo_id)
+    if local_path.exists() and local_path.is_dir():
+        model_dir = local_path
+    else:
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            raise ImportError(
+                "huggingface_hub is required to download models from Hugging Face. "
+                "Install via: pip install huggingface_hub"
+            )
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"Checking for {repo_id}...")
+        model_dir = CACHE_DIR / repo_id.replace("/", "--")
+        if not model_dir.exists():
+            print(f"Downloading {repo_id} from Hugging Face...")
+            snapshot_download(repo_id=repo_id, local_dir=str(model_dir))
+
+    target_dir = Path(output_dir) if output_dir else model_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    interleaved_path = target_dir / "model_interleaved.safetensors"
+
+    if interleaved_path.exists() and output_dir is None:
         print("Packed weights found. Ready for inference.")
         return model_dir
-        
-    print("Packed weights not found. JIT Transcoding...")
-    original_safetensors = model_dir / "model.safetensors"
-    if not original_safetensors.exists():
-        raise FileNotFoundError(f"Could not find model.safetensors in {model_dir}")
-        
-    weights = mx.load(str(original_safetensors))
+
+    print(f"Packed weights not found in {target_dir}. JIT Transcoding...")
+    safetensors_files = sorted([
+        f for f in model_dir.glob("*.safetensors")
+        if f.name != "model_interleaved.safetensors"
+    ])
+    if not safetensors_files:
+        raise FileNotFoundError(f"Could not find any .safetensors files in {model_dir}")
+
+    weights = {}
+    for sf in safetensors_files:
+        print(f"Loading shard {sf.name}...")
+        weights.update(mx.load(str(sf)))
+
     new_weights = {}
-    
     prefixes = set()
     for k in weights.keys():
         if ".weight" in k and weights[k].dtype == mx.uint32:
             prefixes.add(k.replace(".weight", ""))
-            
+
     for k, v in weights.items():
         if "signs" in k:
-            new_weights[k] = v 
+            new_weights[k] = v
             continue
         if any(k.startswith(p) for p in prefixes):
-            continue 
-        new_weights[k] = v 
-        
+            continue
+        new_weights[k] = v
+
     start = time.time()
-    print(f"Found {len(prefixes)} layers to transcode.")
-    
+    print(f"Found {len(prefixes)} layers to pack into interleaved format.")
+
     for i, p in enumerate(prefixes):
-        print(f"[{i+1}/{len(prefixes)}] Transcoding {p} ...\r", end="", flush=True)
+        print(f"[{i+1}/{len(prefixes)}] Packing {p} ...\r", end="", flush=True)
         w = weights[f"{p}.weight"]
         s = weights.get(f"{p}.scales")
         b = weights.get(f"{p}.biases")
-        
+
         if s is None or b is None:
             continue
-            
+
         w_fp16 = mx.dequantize(w, s, b, group_size=128, bits=2)
         w_interleaved, pad_k = pack_interleaved(w_fp16.T, group_size=128)
         mx.eval(w_interleaved)
-        
+
         new_weights[f"{p}.weight_packed"] = w_interleaved
         if pad_k > 0:
             new_weights[f"{p}.pad_k"] = mx.array(pad_k, dtype=mx.uint32)
-            
+
         del weights[f"{p}.weight"]
         del weights[f"{p}.scales"]
         del weights[f"{p}.biases"]
-            
-    print(f"\nSaving transcoded model to {interleaved_path} (took {time.time()-start:.2f}s)...")
+
+    print(f"\nSaving packed model to {interleaved_path} (took {time.time()-start:.2f}s)...")
     mx.save_safetensors(str(interleaved_path), new_weights)
-    print("Transcoding complete!")
-    return model_dir
+    print("Packing complete!")
+    return target_dir
 
 def serve(
     repo_id: str,
@@ -131,8 +142,9 @@ def main():
     serve_parser.add_argument("--kv-group-size", type=int, default=64, help="KV cache quantization group size")
     serve_parser.add_argument("--max-kv-size", type=int, default=None, help="Maximum KV cache size for rotating/sliding window")
     
-    pack_parser = subparsers.add_parser("pack", help="Explicitly pack a model")
-    pack_parser.add_argument("repo_id", help="Hugging Face Repo ID")
+    pack_parser = subparsers.add_parser("pack", help="Explicitly pack a model into hardware-vectorized interleaved format")
+    pack_parser.add_argument("repo_id", help="Hugging Face Repo ID or local directory")
+    pack_parser.add_argument("--output", "-o", type=str, default=None, help="Target directory for packed weights (defaults to model directory)")
     
     args = parser.parse_args()
     
@@ -148,7 +160,7 @@ def main():
             max_kv_size=args.max_kv_size
         )
     elif args.command == "pack":
-        download_and_transcode(args.repo_id)
+        download_and_transcode(args.repo_id, output_dir=args.output)
     else:
         parser.print_help()
 
