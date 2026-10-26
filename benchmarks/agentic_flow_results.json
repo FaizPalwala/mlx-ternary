@@ -1,0 +1,140 @@
+{
+  "kv_16": [
+    {
+      "prefill_ms": 10939.488790929317,
+      "prefill_tps": 23.40145914425793,
+      "gen_tps": 7.986291309129363,
+      "gen_ms_tok": 125.2145659721767,
+      "cache_mb": 197.625,
+      "active_vram_gb": 6.565869709476829,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 1 (Task Init)",
+      "context_length": 256
+    },
+    {
+      "prefill_ms": 9539.123625028878,
+      "prefill_tps": 25.578869673078728,
+      "gen_tps": 7.800602298443084,
+      "gen_ms_tok": 128.19522925807783,
+      "cache_mb": 221.625,
+      "active_vram_gb": 6.589307209476829,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 2 (+Tool 1 Logs)",
+      "context_length": 512
+    },
+    {
+      "prefill_ms": 19278.18795805797,
+      "prefill_tps": 25.936047572925965,
+      "gen_tps": 7.356525912859656,
+      "gen_ms_tok": 135.93372902444875,
+      "cache_mb": 246.75,
+      "active_vram_gb": 6.6139816250652075,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 3 (+Tool 2 Stacktrace)",
+      "context_length": 1024
+    },
+    {
+      "prefill_ms": 42882.92008289136,
+      "prefill_tps": 23.59913919210341,
+      "gen_tps": 6.438567875102543,
+      "gen_ms_tok": 155.31404178667194,
+      "cache_mb": 342.75,
+      "active_vram_gb": 6.707931896671653,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 4 (+Full Context)",
+      "context_length": 2048
+    }
+  ],
+  "kv_8": [
+    {
+      "prefill_ms": 9470.312166027725,
+      "prefill_tps": 27.031843883492378,
+      "gen_tps": 15.595812042314446,
+      "gen_ms_tok": 64.11977762278791,
+      "cache_mb": 167.625,
+      "active_vram_gb": 6.537228962406516,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 1 (Task Init)",
+      "context_length": 256
+    },
+    {
+      "prefill_ms": 9109.5447500702,
+      "prefill_tps": 26.78509263573459,
+      "gen_tps": 15.354857918590064,
+      "gen_ms_tok": 65.12596894754097,
+      "cache_mb": 176.625,
+      "active_vram_gb": 6.545361896976829,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 2 (+Tool 1 Logs)",
+      "context_length": 512
+    },
+    {
+      "prefill_ms": 19950.578291900456,
+      "prefill_tps": 25.061930169863306,
+      "gen_tps": 13.953374833361282,
+      "gen_ms_tok": 71.66724981895338,
+      "cache_mb": 186.046875,
+      "active_vram_gb": 6.555677792057395,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 3 (+Tool 2 Stacktrace)",
+      "context_length": 1024
+    },
+    {
+      "prefill_ms": 42804.67366613448,
+      "prefill_tps": 23.642278128162864,
+      "gen_tps": 8.316358204662208,
+      "gen_ms_tok": 120.24494080105796,
+      "cache_mb": 222.046875,
+      "active_vram_gb": 6.591019054874778,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 4 (+Full Context)",
+      "context_length": 2048
+    }
+  ],
+  "kv_4": [
+    {
+      "prefill_ms": 9343.587416922674,
+      "prefill_tps": 27.398470049773884,
+      "gen_tps": 15.659857426340269,
+      "gen_ms_tok": 63.85754178821419,
+      "cache_mb": 159.625,
+      "active_vram_gb": 6.529370686039329,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 1 (Task Init)",
+      "context_length": 256
+    },
+    {
+      "prefill_ms": 8914.852832909673,
+      "prefill_tps": 27.37005361426276,
+      "gen_tps": 16.311416703262086,
+      "gen_ms_tok": 61.30675331223756,
+      "cache_mb": 164.625,
+      "active_vram_gb": 6.533658405765891,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 2 (+Tool 1 Logs)",
+      "context_length": 512
+    },
+    {
+      "prefill_ms": 18914.782874984667,
+      "prefill_tps": 26.434350492136186,
+      "gen_tps": 10.201673969205464,
+      "gen_ms_tok": 98.02312865698089,
+      "cache_mb": 169.859375,
+      "active_vram_gb": 6.540052792057395,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 3 (+Tool 2 Stacktrace)",
+      "context_length": 1024
+    },
+    {
+      "prefill_ms": 42565.946583170444,
+      "prefill_tps": 23.774873607535856,
+      "gen_tps": 7.860584676213483,
+      "gen_ms_tok": 127.21699990409738,
+      "cache_mb": 189.859375,
+      "active_vram_gb": 6.55978431366384,
+      "peak_vram_gb": 12.626627445220947,
+      "milestone": "Turn 4 (+Full Context)",
+      "context_length": 2048
+    }
+  ]
+}

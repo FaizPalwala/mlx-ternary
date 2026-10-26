@@ -35,11 +35,11 @@ Comprehensive performance evaluations across Apple Silicon and discrete GPUs for
 
 ```bash
 # Run layer-by-layer kernel comparison vs normal MLX 2-bit:
-python testing-artifacts/benchmarks/compare_bonsai.py
+python benchmarks/compare_bonsai.py
 
 # Run end-to-end token generation benchmark:
-python testing-artifacts/benchmarks/benchmark_e2e.py
+python benchmarks/benchmark_e2e.py
 
 # Run multi-turn agentic context growth & KV cache evaluation:
-python testing-artifacts/benchmarks/benchmark_agentic_flow.py
+python benchmarks/benchmark_agentic_flow.py
 ```
