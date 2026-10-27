@@ -1,9 +1,0 @@
-{
-  "prompt_tokens": 31,
-  "generated_tokens": 15,
-  "ttft_ms": 1535.8042500447482,
-  "prefill_tps": 20.184864053538572,
-  "generation_tps": 9.983671066760866,
-  "avg_token_ms": 100.16355640254915,
-  "peak_vram_gb": 6.725415112450719
-}
