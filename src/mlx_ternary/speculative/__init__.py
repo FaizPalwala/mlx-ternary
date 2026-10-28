@@ -13,6 +13,10 @@ from .draft_model import (
     load_draft_model,
     draft_speculative_generate,
 )
+from .self_speculative import (
+    LayerPrunedDraftModel,
+    self_speculative_generate,
+)
 
 __all__ = [
     "find_candidate_tokens",
@@ -22,4 +26,6 @@ __all__ = [
     "VocabularyMapper",
     "load_draft_model",
     "draft_speculative_generate",
+    "LayerPrunedDraftModel",
+    "self_speculative_generate",
 ]
