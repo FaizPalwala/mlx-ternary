@@ -44,49 +44,64 @@ constant half base3_lut_high[243] = {{
 
 _LUT_HEADER = _build_lut_header()
 
-def get_gemv_source(M, K, N, G_SIZE, S=1):
+def get_narrow_gemv_source(M: int, K: int, N: int, G_SIZE: int) -> str:
+    """
+    32-lane cooperative SIMD warp reduction GEMV for narrow layers (N <= 1024, e.g. Attention KV).
+    - Grid: (32, ((N + tg_y - 1) // tg_y) * tg_y, M)
+    - Threadgroup: (32, tg_y, 1) where tg_y = 4.
+    - Intra-warp simd_sum() reduction; 0 threadgroup barriers.
+    - Eliminates synchronization tax and saturates all 20 GPU cores.
+    """
     num_bytes = 26 if G_SIZE == 128 else 30
-    
+
     source = f"""
-    uint tid = thread_position_in_grid.x;
-    uint s_idx = thread_position_in_grid.y;
-    uint row = thread_position_in_grid.z;
+    uint lane_id = thread_position_in_threadgroup.x;      
+    uint col = thread_position_in_grid.y;          
+    uint row = thread_position_in_grid.z;          
     
-    if (row >= {M} || s_idx >= {S} || tid >= {N}) {{
+    if (row >= {M} || col >= {N} || lane_id >= 32) {{
         return;
     }}
 
-    uint col = tid;
     uint K_blocks = {K} / {G_SIZE};
-    uint blocks_per_slice = (K_blocks + {S} - 1) / {S};
-    uint k_start = s_idx * blocks_per_slice;
-    uint k_end = min(k_start + blocks_per_slice, K_blocks);
+    uint blocks_per_thread = (K_blocks + 31) / 32;
+    uint start_k = lane_id * blocks_per_thread;
+    uint end_k = min(start_k + blocks_per_thread, K_blocks);
 
     half acc = 0;
-
-    device const uchar* w_base = (device const uchar*)interleaved_weights;
     device const half* act_ptr = activations + row * {K};
 
-    for (uint k = k_start; k < k_end; k++) {{
-        device const uchar* block_ptr = w_base + (k * {N} + col) * 32;
-        half scale = *((device const half*)block_ptr);
+    for (uint k = start_k; k < end_k; k++) {{
+        uint block_offset_uint4 = (k * {N} + col) * 2;
+        device const uint4* w_ptr = (device const uint4*)interleaved_weights;
+        uint4 vec0 = w_ptr[block_offset_uint4];
+        uint4 vec1 = w_ptr[block_offset_uint4 + 1];
         
+        half scale = as_type<half>((uint16_t)(vec0.x & 0xFFFF));
         half block_acc = 0;
         uint x_base = k * {G_SIZE};
 
+        struct PackedBlock {{
+            uint4 v0;
+            uint4 v1;
+        }};
+        PackedBlock blk = {{vec0, vec1}};
+        thread const uchar* blk_bytes = (thread const uchar*)&blk;
+
         #pragma unroll({num_bytes})
         for (uint i = 0; i < {num_bytes}; i++) {{
-            uint8_t b = block_ptr[2 + i];
+            uint8_t b = blk_bytes[2 + i];
             half4 w_low = base3_lut_low[b];
             half w_high = base3_lut_high[b];
             uint curr_x = x_base + i * 5;
-"""
+    """
+
     if G_SIZE == 150:
         source += """
             half4 x_low = half4(act_ptr[curr_x], act_ptr[curr_x + 1], act_ptr[curr_x + 2], act_ptr[curr_x + 3]);
             half x_high = act_ptr[curr_x + 4];
             block_acc += dot(x_low, w_low) + x_high * w_high;
-"""
+        """
     else:
         source += """
             if (i == 25) {
@@ -96,13 +111,112 @@ def get_gemv_source(M, K, N, G_SIZE, S=1):
                 half x_high = act_ptr[curr_x + 4];
                 block_acc += dot(x_low, w_low) + x_high * w_high;
             }
-"""
+        """
+
     source += f"""
         }}
         acc += block_acc * scale;
     }}
 
-    output[row * ({S} * {N}) + s_idx * {N} + col] = acc;
+    half total = simd_sum(acc);
+
+    if (lane_id == 0) {{
+        output[row * {N} + col] = total;
+    }}
+    """
+    return source
+
+
+def get_wide_gemv_source(M: int, K: int, N: int, G_SIZE: int) -> str:
+    """
+    Threadgroup shared-memory activation caching GEMV for wide layers (N > 1024, e.g. MLP Gate/Up, MLP Down).
+    - Grid: (((N + tg_size - 1) // tg_size) * tg_size, M, 1)
+    - Threadgroup: (tg_size, 1, 1) where tg_size = 128.
+    - Cooperatively loads activation tiles into on-chip SRAM (`threadgroup half shared_act[G_SIZE]`).
+    - Eliminates redundant DRAM activation reads across columns and fetches 128-byte coalesced weight bursts.
+    """
+    num_bytes = 26 if G_SIZE == 128 else 30
+
+    source = f"""
+    uint tid = thread_index_in_threadgroup;
+    uint col = thread_position_in_grid.x;
+    uint row = thread_position_in_grid.y;
+    
+    threadgroup half shared_act[{G_SIZE}];
+
+    uint K_blocks = {K} / {G_SIZE};
+    half acc = 0;
+    device const half* act_ptr = activations + row * {K};
+
+    for (uint k_block = 0; k_block < K_blocks; k_block++) {{
+        // 1. Cooperative load into SRAM
+        if (tid < 128) {{
+            shared_act[tid] = act_ptr[k_block * {G_SIZE} + tid];
+        }}
+    """
+    if G_SIZE == 150:
+        source += f"""
+        if (tid < 22) {{
+            shared_act[128 + tid] = act_ptr[k_block * 150 + 128 + tid];
+        }}
+        """
+    source += f"""
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2. Compute dot product reading from on-chip SRAM
+        if (col < {N} && row < {M}) {{
+            uint block_offset_uint4 = (k_block * {N} + col) * 2;
+            device const uint4* w_ptr = (device const uint4*)interleaved_weights;
+            uint4 vec0 = w_ptr[block_offset_uint4];
+            uint4 vec1 = w_ptr[block_offset_uint4 + 1];
+            
+            half scale = as_type<half>((uint16_t)(vec0.x & 0xFFFF));
+            half block_acc = 0;
+
+            struct PackedBlock {{
+                uint4 v0;
+                uint4 v1;
+            }};
+            PackedBlock blk = {{vec0, vec1}};
+            thread const uchar* blk_bytes = (thread const uchar*)&blk;
+
+            #pragma unroll({num_bytes})
+            for (uint i = 0; i < {num_bytes}; i++) {{
+                uint8_t b = blk_bytes[2 + i];
+                half4 w_low = base3_lut_low[b];
+                half w_high = base3_lut_high[b];
+                uint curr_x = i * 5;
+    """
+
+    if G_SIZE == 150:
+        source += """
+                half4 x_low = half4(shared_act[curr_x], shared_act[curr_x + 1], shared_act[curr_x + 2], shared_act[curr_x + 3]);
+                half x_high = shared_act[curr_x + 4];
+                block_acc += dot(x_low, w_low) + x_high * w_high;
+        """
+    else:
+        source += """
+                if (i == 25) {
+                    block_acc += shared_act[curr_x] * w_low.x + shared_act[curr_x + 1] * w_low.y + shared_act[curr_x + 2] * w_low.z;
+                } else {
+                    half4 x_low = half4(shared_act[curr_x], shared_act[curr_x + 1], shared_act[curr_x + 2], shared_act[curr_x + 3]);
+                    half x_high = shared_act[curr_x + 4];
+                    block_acc += dot(x_low, w_low) + x_high * w_high;
+                }
+        """
+
+    source += f"""
+            }}
+            acc += block_acc * scale;
+        }}
+
+        // 3. Exit barrier before next tile load
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    if (col < {N} && row < {M}) {{
+        output[row * {N} + col] = acc;
+    }}
     """
     return source
 
@@ -244,6 +358,7 @@ def get_gemm_source(M, K, N, G_SIZE):
     """
     return source
 
+
 def ternary_matmul(x: mx.array, w_packed: mx.array, group_size: int = None) -> mx.array:
     orig_shape = x.shape
     x_flat = x.reshape(-1, orig_shape[-1])
@@ -259,40 +374,68 @@ def ternary_matmul(x: mx.array, w_packed: mx.array, group_size: int = None) -> m
         group_size = K // K_blocks
         
     use_gemm = M > 16
-    kernel_type = "gemm" if use_gemm else "gemv"
     
-    split_k = 1
-    if not use_gemm and M <= 2 and N <= 1024 and K_blocks >= 8:
-        split_k = min(8, K_blocks)
-        
-    shape_key = (kernel_type, M, K, N, group_size, split_k)
-    
-    if shape_key not in _KERNEL_CACHE:
-        if use_gemm:
-            source = get_gemm_source(M, K, N, group_size)
-        else:
-            source = get_gemv_source(M, K, N, group_size, S=split_k)
-            
-        kernel = fast.metal_kernel(
-            name=f"ternary_{kernel_type}_{M}_{K}_{N}_{group_size}_s{split_k}",
-            input_names=["activations", "interleaved_weights"],
-            output_names=["output"],
-            source=source,
-            header=_LUT_HEADER
-        )
-        _KERNEL_CACHE[shape_key] = kernel
-
     if use_gemm:
+        kernel_type = "gemm"
+        shape_key = (kernel_type, M, K, N, group_size)
+        if shape_key not in _KERNEL_CACHE:
+            source = get_gemm_source(M, K, N, group_size)
+            kernel = fast.metal_kernel(
+                name=f"ternary_{kernel_type}_{M}_{K}_{N}_{group_size}",
+                input_names=["activations", "interleaved_weights"],
+                output_names=["output"],
+                source=source,
+                header=_LUT_HEADER
+            )
+            _KERNEL_CACHE[shape_key] = kernel
+
         grid_x = ((N + 31) // 32) * 64
         grid_y = (M + 31) // 32
         grid = (grid_x, grid_y, 1)
         threadgroup = (64, 1, 1)
         out_shapes = [(M, N)]
     else:
-        grid_x = ((N + 63) // 64) * 64
-        grid = (grid_x, split_k, M)
-        threadgroup = (64, 1, 1)
-        out_shapes = [(M, split_k, N)] if split_k > 1 else [(M, N)]
+        # GEMV regime (M <= 16): Shape-aware hybrid dispatch
+        if N <= 1024:
+            # Narrow layers (e.g. Attention KV): SIMD Cooperative Warp reduction (0 barriers)
+            kernel_type = "narrow_gemv"
+            shape_key = (kernel_type, M, K, N, group_size)
+            if shape_key not in _KERNEL_CACHE:
+                source = get_narrow_gemv_source(M, K, N, group_size)
+                kernel = fast.metal_kernel(
+                    name=f"ternary_{kernel_type}_{M}_{K}_{N}_{group_size}",
+                    input_names=["activations", "interleaved_weights"],
+                    output_names=["output"],
+                    source=source,
+                    header=_LUT_HEADER
+                )
+                _KERNEL_CACHE[shape_key] = kernel
+
+            tg_y = 4
+            grid_y = ((N + tg_y - 1) // tg_y) * tg_y
+            grid = (32, grid_y, M)
+            threadgroup = (32, tg_y, 1)
+            out_shapes = [(M, N)]
+        else:
+            # Wide layers (e.g. MLP Gate/Up, MLP Down, Attention Q/O): Shared SRAM activation caching
+            kernel_type = "wide_gemv"
+            shape_key = (kernel_type, M, K, N, group_size)
+            if shape_key not in _KERNEL_CACHE:
+                source = get_wide_gemv_source(M, K, N, group_size)
+                kernel = fast.metal_kernel(
+                    name=f"ternary_{kernel_type}_{M}_{K}_{N}_{group_size}",
+                    input_names=["activations", "interleaved_weights"],
+                    output_names=["output"],
+                    source=source,
+                    header=_LUT_HEADER
+                )
+                _KERNEL_CACHE[shape_key] = kernel
+
+            tg_size = 128
+            grid_x = ((N + tg_size - 1) // tg_size) * tg_size
+            grid = (grid_x, M, 1)
+            threadgroup = (tg_size, 1, 1)
+            out_shapes = [(M, N)]
 
     out = _KERNEL_CACHE[shape_key](
         inputs=[x_flat, w_packed],
@@ -302,7 +445,7 @@ def ternary_matmul(x: mx.array, w_packed: mx.array, group_size: int = None) -> m
         output_dtypes=[mx.float16]
     )
     
-    res = out[0].sum(axis=1) if split_k > 1 else out[0]
+    res = out[0]
     if len(orig_shape) > 2:
         return res.reshape(*orig_shape[:-1], N)
     elif len(orig_shape) == 1:
