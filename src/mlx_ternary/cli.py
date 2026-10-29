@@ -128,10 +128,49 @@ def serve(
         max_kv_size=max_kv_size
     )
 
+def generate_cli(
+    repo_id: str,
+    prompt: str,
+    speculative: str = "auto",
+    draft_layers: int = 16,
+    draft_model: str = "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+    max_tokens: int = 256,
+    verbose: bool = False,
+):
+    from .server import setup_model_loader
+    from .speculative.router import generate_speculative
+
+    local_path = Path(repo_id)
+    if local_path.exists() and local_path.is_dir():
+        model_dir = local_path
+    else:
+        model_dir = download_and_transcode(repo_id)
+
+    custom_loader = setup_model_loader(model_dir)
+    if custom_loader is not None:
+        model, tokenizer = custom_loader()
+    else:
+        from mlx_lm import load
+        model, tokenizer = load(str(model_dir))
+
+    for chunk in generate_speculative(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        mode=speculative,
+        max_tokens=max_tokens,
+        draft_layers=draft_layers,
+        draft_model_path=draft_model,
+        verbose=verbose,
+    ):
+        print(chunk, end="", flush=True)
+    print()
+
 def main():
     parser = argparse.ArgumentParser(prog="mlx_ternary")
     subparsers = parser.add_subparsers(dest="command")
     
+    # Serve subparser
     serve_parser = subparsers.add_parser("serve", help="Serve a model")
     serve_parser.add_argument("repo_id", help="Hugging Face Repo ID or local directory")
     serve_parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface (default: 127.0.0.1)")
@@ -142,9 +181,47 @@ def main():
     serve_parser.add_argument("--kv-group-size", type=int, default=64, help="KV cache quantization group size")
     serve_parser.add_argument("--max-kv-size", type=int, default=None, help="Maximum KV cache size for rotating/sliding window")
     
+    # Pack subparser
     pack_parser = subparsers.add_parser("pack", help="Explicitly pack a model into hardware-vectorized interleaved format")
     pack_parser.add_argument("repo_id", help="Hugging Face Repo ID or local directory")
     pack_parser.add_argument("--output", "-o", type=str, default=None, help="Target directory for packed weights (defaults to model directory)")
+
+    # Generate subparser
+    generate_parser = subparsers.add_parser("generate", help="Generate text using ternary inference")
+    generate_parser.add_argument("repo_id", help="Hugging Face Repo ID or local directory")
+    generate_parser.add_argument("prompt_pos", nargs="?", default=None, help="Prompt text (if not provided via --prompt)")
+    generate_parser.add_argument("--prompt", "-p", type=str, default=None, help="Prompt text")
+    generate_parser.add_argument(
+        "--speculative",
+        type=str,
+        choices=["auto", "pld", "self", "qwen", "none"],
+        default="auto",
+        help="Speculative decoding mode (default: auto)",
+    )
+    generate_parser.add_argument(
+        "--draft-layers",
+        type=int,
+        default=16,
+        help="Number of layers for self-speculative draft model (default: 16)",
+    )
+    generate_parser.add_argument(
+        "--draft-model",
+        type=str,
+        default="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+        help="Draft model repo ID for cross-model speculative decoding",
+    )
+    generate_parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=256,
+        help="Maximum tokens to generate (default: 256)",
+    )
+    generate_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Print speculative routing telemetry and token stats to stderr",
+    )
     
     args = parser.parse_args()
     
@@ -161,6 +238,19 @@ def main():
         )
     elif args.command == "pack":
         download_and_transcode(args.repo_id, output_dir=args.output)
+    elif args.command == "generate":
+        prompt = args.prompt or args.prompt_pos
+        if not prompt:
+            generate_parser.error("A prompt is required (provide positionally or via --prompt/-p)")
+        generate_cli(
+            args.repo_id,
+            prompt,
+            speculative=args.speculative,
+            draft_layers=args.draft_layers,
+            draft_model=args.draft_model,
+            max_tokens=args.max_tokens,
+            verbose=args.verbose,
+        )
     else:
         parser.print_help()
 

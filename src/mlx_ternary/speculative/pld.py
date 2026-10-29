@@ -243,3 +243,8 @@ def pld_generate(
                 yield current_token, False, stats
                 if current_token in stop_tokens:
                     break
+
+
+# Alias for universal speculative router
+generate_pld_speculative = pld_generate
+

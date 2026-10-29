@@ -317,3 +317,8 @@ def draft_speculative_generate(
             yield curr_target_tok, False, stats
             if curr_target_tok in stop_tokens:
                 break
+
+
+# Alias for universal speculative router
+generate_draft_speculative = draft_speculative_generate
+

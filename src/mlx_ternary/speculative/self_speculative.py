@@ -259,3 +259,8 @@ def self_speculative_generate(
             yield curr_token, False, stats
             if curr_token in stop_tokens:
                 break
+
+
+# Alias for universal speculative router
+generate_self_speculative = self_speculative_generate
+
