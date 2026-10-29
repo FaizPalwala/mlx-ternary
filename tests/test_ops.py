@@ -8,6 +8,7 @@ import mlx_ternary
 from mlx_ternary.quantize import pack_interleaved
 
 def check_matmul_equivalence(M, K, N, group_size):
+    mx.random.seed(42)
     x = mx.random.normal((M, K)).astype(mx.float16)
     w_raw = mx.random.randint(0, 3, (K, N)).astype(mx.float16) - 1.0
     w_interleaved, _ = pack_interleaved(w_raw, group_size=group_size)

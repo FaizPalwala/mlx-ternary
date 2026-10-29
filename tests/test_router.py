@@ -269,3 +269,25 @@ def test_cli_generate_argument_parsing():
     assert args2.draft_layers == 8
     assert args2.max_tokens == 100
     assert args2.verbose is True
+
+
+def test_cli_bench_argument_parsing():
+    import argparse
+    from mlx_ternary.cli import get_hardware_info
+
+    hw = get_hardware_info()
+    assert isinstance(hw, dict)
+    assert "chip" in hw
+    assert "memory_gb" in hw
+
+    parser = argparse.ArgumentParser(prog="mlx_ternary")
+    subparsers = parser.add_subparsers(dest="command")
+    bench_p = subparsers.add_parser("bench")
+    bench_p.add_argument("--duration-sec", type=float, default=2.0)
+    bench_p.add_argument("--verbose", "-v", action="store_true")
+
+    args = parser.parse_args(["bench", "--duration-sec", "0.5", "-v"])
+    assert args.command == "bench"
+    assert args.duration_sec == 0.5
+    assert args.verbose is True
+
