@@ -20,7 +20,6 @@ Key Invariants:
 from typing import List, Tuple, Optional, Set, Generator, Dict, Any
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.qwen3_5 import create_attention_mask, create_ssm_mask
 
 from .pld import save_cache_checkpoint, restore_cache_checkpoint
 
@@ -50,10 +49,18 @@ class LayerPrunedDraftModel:
         fa_mask = None
         ssm_mask = None
         if cache is not None:
+            try:
+                from mlx_lm.models.qwen3_5 import create_attention_mask, create_ssm_mask
+            except Exception:
+                create_attention_mask = None
+                create_ssm_mask = None
+
             if self.fa_idx < self.num_layers and cache[self.fa_idx] is not None:
-                fa_mask = create_attention_mask(h, cache[self.fa_idx])
+                if create_attention_mask is not None:
+                    fa_mask = create_attention_mask(h, cache[self.fa_idx])
             if self.ssm_idx < self.num_layers and cache[self.ssm_idx] is not None:
-                ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+                if create_ssm_mask is not None:
+                    ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
 
         for layer, c in zip(self.layers, cache if cache else [None] * self.num_layers):
             mask = ssm_mask if layer.is_linear else fa_mask
