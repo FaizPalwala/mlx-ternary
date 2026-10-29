@@ -16,6 +16,12 @@ class TestServerLoader(unittest.TestCase):
         if not (model_path / "runtime").exists():
             self.skipTest("Bonsai model runtime directory not found")
 
+        try:
+            import mlx_lm
+            import transformers
+        except ImportError:
+            self.skipTest("mlx_lm and transformers required for server loader test")
+
         loader = setup_model_loader(model_path, kv_bits=8, kv_group_size=64)
         self.assertIsNotNone(loader)
 
