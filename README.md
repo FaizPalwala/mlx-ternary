@@ -173,6 +173,17 @@ pytest tests/ -v
 
 ---
 
+## Support & Compute Patronage
+
+If you find `mlx-ternary` valuable for local research or edge deployments on Apple Silicon, consider supporting ongoing low-level kernel development:
+
+* **GitHub Sponsors:** [github.com/sponsors/faizpalwala](https://github.com/sponsors/faizpalwala)
+* **Compute Fuel:** [buymeacoffee.com/faizpalwala](https://buymeacoffee.com/faizpalwala)
+
+Patronage directly funds Apple Silicon hardware testbed availability and continuous multi-device verification.
+
+---
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
