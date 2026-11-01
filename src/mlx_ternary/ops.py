@@ -129,10 +129,14 @@ def get_narrow_gemv_source(M: int, K: int, N: int, G_SIZE: int) -> str:
 
 def get_wide_gemv_source(M: int, K: int, N: int, G_SIZE: int) -> str:
     """
-    Threadgroup shared-memory activation caching GEMV for wide layers (N > 1024, e.g. MLP Gate/Up, MLP Down).
+    Generate Metal Shading Language source for 1D contiguous column tiling GEMV with
+    on-chip SRAM activation caching, aligned 20-trit vector chunking, and 4-way ILP accumulators.
+    - Dispatched when N > 1024 (e.g. MLP Gate/Up, MLP Down, Attention Q/O).
     - Grid: (((N + tg_size - 1) // tg_size) * tg_size, M, 1)
     - Threadgroup: (tg_size, 1, 1) where tg_size = 128.
     - Cooperatively loads activation tiles into on-chip SRAM (`threadgroup half shared_act[G_SIZE]`).
+    - Aligned 20-Trit Vector Chunking (Lever 2a): Slashes shared memory loads by 75% via contiguous half4 loads.
+    - 4-Way ILP Accumulator Splitting (Lever 3): Breaks 3-4 cycle FP16 FMA RAW register dependency stalls.
     - Eliminates redundant DRAM activation reads across columns and fetches 128-byte coalesced weight bursts.
     """
     num_bytes = 26 if G_SIZE == 128 else 30
@@ -171,7 +175,6 @@ def get_wide_gemv_source(M: int, K: int, N: int, G_SIZE: int) -> str:
             uint4 vec1 = w_ptr[block_offset_uint4 + 1];
             
             half scale = as_type<half>((uint16_t)(vec0.x & 0xFFFF));
-            half block_acc = 0;
 
             struct PackedBlock {{
                 uint4 v0;
@@ -179,35 +182,80 @@ def get_wide_gemv_source(M: int, K: int, N: int, G_SIZE: int) -> str:
             }};
             PackedBlock blk = {{vec0, vec1}};
             thread const uchar* blk_bytes = (thread const uchar*)&blk;
+    """
 
+    if G_SIZE == 128:
+        source += """
+            half block_acc0 = 0;
+            half block_acc1 = 0;
+            half block_acc2 = 0;
+            half block_acc3 = 0;
+
+            // 6 chunks x 4 bytes = 24 bytes (120 elements)
+            #pragma unroll(6)
+            for (uint c = 0; c < 6; c++) {
+                threadgroup const half4* x_vec = (threadgroup const half4*)&shared_act[c * 20];
+                half4 x0 = x_vec[0];
+                half4 x1 = x_vec[1];
+                half4 x2 = x_vec[2];
+                half4 x3 = x_vec[3];
+                half4 x4 = x_vec[4];
+
+                uint8_t b0 = blk_bytes[2 + c * 4 + 0];
+                uint8_t b1 = blk_bytes[2 + c * 4 + 1];
+                uint8_t b2 = blk_bytes[2 + c * 4 + 2];
+                uint8_t b3 = blk_bytes[2 + c * 4 + 3];
+
+                half4 w0_low = base3_lut_low[b0];
+                half w0_high = base3_lut_high[b0];
+                half4 w1_low = base3_lut_low[b1];
+                half w1_high = base3_lut_high[b1];
+                half4 w2_low = base3_lut_low[b2];
+                half w2_high = base3_lut_high[b2];
+                half4 w3_low = base3_lut_low[b3];
+                half w3_high = base3_lut_high[b3];
+
+                block_acc0 += dot(x0, w0_low) + x1.x * w0_high;
+                block_acc1 += x1.y * w1_low.x + x1.z * w1_low.y + x1.w * w1_low.z + x2.x * w1_low.w + x2.y * w1_high;
+                block_acc2 += x2.z * w2_low.x + x2.w * w2_low.y + x3.x * w2_low.z + x3.y * w2_low.w + x3.z * w2_high;
+                block_acc3 += x3.w * w3_low.x + dot(x4, half4(w3_low.y, w3_low.z, w3_low.w, w3_high));
+            }
+
+            // Tail 2 bytes (bytes 24 and 25 -> elements 120..127)
+            threadgroup const half4* tail_vec = (threadgroup const half4*)&shared_act[120];
+            half4 tail0 = tail_vec[0];
+            half4 tail1 = tail_vec[1];
+
+            uint8_t b24 = blk_bytes[2 + 24];
+            uint8_t b25 = blk_bytes[2 + 25];
+
+            half4 w24_low = base3_lut_low[b24];
+            half w24_high = base3_lut_high[b24];
+            half4 w25_low = base3_lut_low[b25];
+
+            block_acc0 += dot(tail0, w24_low) + tail1.x * w24_high;
+            block_acc1 += tail1.y * w25_low.x + tail1.z * w25_low.y + tail1.w * w25_low.z;
+
+            half block_acc = (block_acc0 + block_acc1) + (block_acc2 + block_acc3);
+            acc += block_acc * scale;
+        """
+    else:
+        source += f"""
+            half block_acc = 0;
             #pragma unroll({num_bytes})
             for (uint i = 0; i < {num_bytes}; i++) {{
                 uint8_t b = blk_bytes[2 + i];
                 half4 w_low = base3_lut_low[b];
                 half w_high = base3_lut_high[b];
                 uint curr_x = i * 5;
-    """
-
-    if G_SIZE == 150:
-        source += """
                 half4 x_low = half4(shared_act[curr_x], shared_act[curr_x + 1], shared_act[curr_x + 2], shared_act[curr_x + 3]);
                 half x_high = shared_act[curr_x + 4];
                 block_acc += dot(x_low, w_low) + x_high * w_high;
-        """
-    else:
-        source += """
-                if (i == 25) {
-                    block_acc += shared_act[curr_x] * w_low.x + shared_act[curr_x + 1] * w_low.y + shared_act[curr_x + 2] * w_low.z;
-                } else {
-                    half4 x_low = half4(shared_act[curr_x], shared_act[curr_x + 1], shared_act[curr_x + 2], shared_act[curr_x + 3]);
-                    half x_high = shared_act[curr_x + 4];
-                    block_acc += dot(x_low, w_low) + x_high * w_high;
-                }
+            }}
+            acc += block_acc * scale;
         """
 
     source += f"""
-            }}
-            acc += block_acc * scale;
         }}
 
         // 3. Exit barrier before next tile load

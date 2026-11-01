@@ -34,6 +34,9 @@ def check_matmul_equivalence(M, K, N, group_size):
 def test_gemv_group128():
     check_matmul_equivalence(M=1, K=256, N=128, group_size=128)
 
+def test_wide_gemv_group128():
+    check_matmul_equivalence(M=1, K=256, N=2048, group_size=128)
+
 def test_gemv_group150():
     check_matmul_equivalence(M=1, K=300, N=128, group_size=150)
 
