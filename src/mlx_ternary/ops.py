@@ -2,6 +2,33 @@ import mlx.core as mx
 import mlx.core.fast as fast
 
 _KERNEL_CACHE = {}
+_GPU_CORE_COUNT = None
+
+
+def _get_gpu_core_count() -> int:
+    """Dynamically query GPU core count on Apple Silicon with fallback."""
+    global _GPU_CORE_COUNT
+    if _GPU_CORE_COUNT is not None:
+        return _GPU_CORE_COUNT
+    try:
+        import subprocess
+        out = subprocess.check_output(["system_profiler", "SPDisplaysDataType"], timeout=2).decode()
+        for line in out.splitlines():
+            if "Total Number of Cores" in line:
+                _GPU_CORE_COUNT = int(line.split(":")[-1].strip())
+                return _GPU_CORE_COUNT
+    except Exception:
+        pass
+    dev_name = mx.device_info().get("device_name", "")
+    if "Max" in dev_name:
+        _GPU_CORE_COUNT = 40
+    elif "Ultra" in dev_name:
+        _GPU_CORE_COUNT = 80
+    elif "Pro" in dev_name:
+        _GPU_CORE_COUNT = 20
+    else:
+        _GPU_CORE_COUNT = 10
+    return _GPU_CORE_COUNT
 
 def _build_lut_header():
     lut_entries = []
@@ -269,6 +296,177 @@ def get_wide_gemv_source(M: int, K: int, N: int, G_SIZE: int) -> str:
     return source
 
 
+def get_elastic_split_k_sources(M: int, K: int, N: int, S: int, group_size: int = 128) -> tuple[str, str]:
+    """
+    Generate Metal Shading Language sources for hardware-elastic Split-K GEMV reduction.
+
+    Args:
+        M: Activation batch/row count.
+        K: Contraction dimension.
+        N: Output dimension.
+        S: Split-K slice count (S >= 1).
+        group_size: Quantization group size (128 or 150).
+
+    Returns:
+        tuple[str, str]: (stage1_source, stage2_source)
+        - stage1_source: Stage 1 partial accumulation kernel across S splits (or direct output if S=1).
+        - stage2_source: Stage 2 parallel vector reduction kernel across S splits.
+    """
+    stage1_source = f"""
+    uint col = thread_position_in_grid.x;
+    uint split_id = thread_position_in_grid.y;
+    uint row = thread_position_in_grid.z;
+
+    if (col >= {N} || split_id >= {S} || row >= {M}) return;
+
+    uint K_blocks = {K} / {group_size};
+    uint blocks_per_split = (K_blocks + {S} - 1) / {S};
+    uint start_block = split_id * blocks_per_split;
+    uint end_block = min(start_block + blocks_per_split, K_blocks);
+
+    if (start_block >= K_blocks) {{
+        {"partial_output[row * (" + str(S) + " * " + str(N) + ") + split_id * " + str(N) + " + col] = 0.0f;" if S > 1 else f"output[row * {N} + col] = 0;"}
+        return;
+    }}
+
+    half acc = 0;
+    device const half* act_block = activations + row * {K} + start_block * {group_size};
+    device const uint4* w_block = ((device const uint4*)interleaved_weights) + (start_block * {N} + col) * 2;
+    uint w_stride = {N} * 2;
+
+    uint4 cur_vec0 = w_block[0];
+    uint4 cur_vec1 = w_block[1];
+    w_block += w_stride;
+
+    for (uint k_block = start_block; k_block < end_block; k_block++) {{
+        uint4 next_vec0 = uint4(0);
+        uint4 next_vec1 = uint4(0);
+        if (k_block + 1 < end_block) {{
+            next_vec0 = w_block[0];
+            next_vec1 = w_block[1];
+            w_block += w_stride;
+        }}
+
+        half scale = as_type<half>((uint16_t)(cur_vec0.x & 0xFFFF));
+
+        struct PackedBlock {{ uint4 v0, v1; }};
+        PackedBlock blk = {{cur_vec0, cur_vec1}};
+        thread const uchar* blk_bytes = (thread const uchar*)&blk;
+    """
+
+    if group_size == 128:
+        stage1_source += f"""
+        half block_acc0 = 0, block_acc1 = 0, block_acc2 = 0, block_acc3 = 0;
+        device const half4* act_vec = (device const half4*)act_block;
+
+        #pragma unroll(6)
+        for (uint c = 0; c < 6; c++) {{
+            half4 x0 = act_vec[c * 5 + 0];
+            half4 x1 = act_vec[c * 5 + 1];
+            half4 x2 = act_vec[c * 5 + 2];
+            half4 x3 = act_vec[c * 5 + 3];
+            half4 x4 = act_vec[c * 5 + 4];
+
+            uint8_t b0 = blk_bytes[2 + c * 4 + 0];
+            uint8_t b1 = blk_bytes[2 + c * 4 + 1];
+            uint8_t b2 = blk_bytes[2 + c * 4 + 2];
+            uint8_t b3 = blk_bytes[2 + c * 4 + 3];
+
+            half4 w0_low = base3_lut_low[b0]; half w0_high = base3_lut_high[b0];
+            half4 w1_low = base3_lut_low[b1]; half w1_high = base3_lut_high[b1];
+            half4 w2_low = base3_lut_low[b2]; half w2_high = base3_lut_high[b2];
+            half4 w3_low = base3_lut_low[b3]; half w3_high = base3_lut_high[b3];
+
+            block_acc0 += dot(x0, w0_low) + x1.x * w0_high;
+            block_acc1 += dot(x1.yzw, w1_low.xyz) + x2.x * w1_low.w + x2.y * w1_high;
+            block_acc2 += dot(x2.zw, w2_low.xy) + dot(x3.xyz, half3(w2_low.z, w2_low.w, w2_high));
+            block_acc3 += x3.w * w3_low.x + dot(x4, half4(w3_low.y, w3_low.z, w3_low.w, w3_high));
+        }}
+
+        device const half4* tail_vec = (device const half4*)(act_block + 120);
+        half4 tail0 = tail_vec[0];
+        half4 tail1 = tail_vec[1];
+
+        uint8_t b24 = blk_bytes[2 + 24];
+        uint8_t b25 = blk_bytes[2 + 25];
+
+        half4 w24_low = base3_lut_low[b24];
+        half w24_high = base3_lut_high[b24];
+        half4 w25_low = base3_lut_low[b25];
+
+        block_acc0 += dot(tail0, w24_low) + tail1.x * w24_high;
+        block_acc1 += dot(tail1.yzw, w25_low.xyz);
+
+        half block_acc = (block_acc0 + block_acc1) + (block_acc2 + block_acc3);
+        acc += block_acc * scale;
+        act_block += 128;
+        cur_vec0 = next_vec0;
+        cur_vec1 = next_vec1;
+        """
+    else:
+        stage1_source += f"""
+        half block_acc = 0;
+
+        #pragma unroll(30)
+        for (uint i = 0; i < 30; i++) {{
+            uint8_t b = blk_bytes[2 + i];
+            half4 w_low = base3_lut_low[b];
+            half w_high = base3_lut_high[b];
+            uint curr_x = i * 5;
+            half4 x_low = half4(act_block[curr_x], act_block[curr_x + 1], act_block[curr_x + 2], act_block[curr_x + 3]);
+            half x_high = act_block[curr_x + 4];
+            block_acc += dot(x_low, w_low) + x_high * w_high;
+        }}
+        acc += block_acc * scale;
+        act_block += 150;
+        cur_vec0 = next_vec0;
+        cur_vec1 = next_vec1;
+        """
+
+    if S > 1:
+        stage1_source += f"""
+    }}
+    partial_output[row * ({S} * {N}) + split_id * {N} + col] = (float)acc;
+    """
+    else:
+        stage1_source += f"""
+    }}
+    output[row * {N} + col] = acc;
+    """
+
+    stage2_source = f"""
+    uint idx = thread_position_in_grid.x;
+    uint row = thread_position_in_grid.y;
+    if (row >= {M}) return;
+
+    #if {1 if N % 4 == 0 else 0}
+    uint N_vec = {N} / 4;
+    if (idx >= N_vec) return;
+
+    device const float4* p_base = (device const float4*)(partial_output + row * ({S} * {N}));
+    float4 sum = float4(0.0f);
+
+    #pragma unroll({S})
+    for (uint s = 0; s < {S}; s++) {{
+        sum += p_base[s * N_vec + idx];
+    }}
+
+    device half4* out_vec = (device half4*)(output + row * {N});
+    out_vec[idx] = half4(sum);
+    #else
+    if (idx >= {N}) return;
+    float sum = 0.0f;
+    #pragma unroll({S})
+    for (uint s = 0; s < {S}; s++) {{
+        sum += partial_output[row * ({S} * {N}) + s * {N} + idx];
+    }}
+    output[row * {N} + idx] = (half)sum;
+    #endif
+    """
+
+    return stage1_source, stage2_source
+
+
 def get_gemm_source(M, K, N, G_SIZE):
     num_bytes = 26 if G_SIZE == 128 else 30
     k_tile = 128 if G_SIZE == 128 else 152
@@ -439,9 +637,14 @@ def ternary_matmul(x: mx.array, w_packed: mx.array, group_size: int = None) -> m
 
         grid_x = ((N + 31) // 32) * 64
         grid_y = (M + 31) // 32
-        grid = (grid_x, grid_y, 1)
-        threadgroup = (64, 1, 1)
-        out_shapes = [(M, N)]
+        out = _KERNEL_CACHE[shape_key](
+            inputs=[x_flat, w_packed],
+            grid=(grid_x, grid_y, 1),
+            threadgroup=(64, 1, 1),
+            output_shapes=[(M, N)],
+            output_dtypes=[mx.float16]
+        )
+        res = out[0]
     else:
         # GEMV regime (M <= 16): Shape-aware hybrid dispatch
         if N <= 1024:
@@ -461,39 +664,95 @@ def ternary_matmul(x: mx.array, w_packed: mx.array, group_size: int = None) -> m
 
             tg_y = 4
             grid_y = ((N + tg_y - 1) // tg_y) * tg_y
-            grid = (32, grid_y, M)
-            threadgroup = (32, tg_y, 1)
-            out_shapes = [(M, N)]
+            out = _KERNEL_CACHE[shape_key](
+                inputs=[x_flat, w_packed],
+                grid=(32, grid_y, M),
+                threadgroup=(32, tg_y, 1),
+                output_shapes=[(M, N)],
+                output_dtypes=[mx.float16]
+            )
+            res = out[0]
         else:
-            # Wide layers (e.g. MLP Gate/Up, MLP Down, Attention Q/O): Shared SRAM activation caching
-            kernel_type = "wide_gemv"
-            shape_key = (kernel_type, M, K, N, group_size)
-            if shape_key not in _KERNEL_CACHE:
-                source = get_wide_gemv_source(M, K, N, group_size)
-                kernel = fast.metal_kernel(
-                    name=f"ternary_{kernel_type}_{M}_{K}_{N}_{group_size}",
-                    input_names=["activations", "interleaved_weights"],
-                    output_names=["output"],
-                    source=source,
-                    header=_LUT_HEADER
+            # Wide layers (e.g. MLP Gate/Up, MLP Down, Attention Q/O)
+            if K >= 8192:
+                # Deep contractions: hardware-elastic split-K reduction
+                cores = _get_gpu_core_count()
+                base_tgs = max(1, (N + 127) // 128)
+                tgs_per_core = 8
+                S = max(1, round((cores * tgs_per_core) / base_tgs))
+                K_blocks = K // group_size
+                S = min(S, K_blocks)
+            else:
+                S = 1
+
+            if S > 1:
+                s1_key = ("split_k_stage1", M, K, N, S, group_size)
+                if s1_key not in _KERNEL_CACHE:
+                    s1_src, _ = get_elastic_split_k_sources(M, K, N, S, group_size)
+                    _KERNEL_CACHE[s1_key] = fast.metal_kernel(
+                        name=f"ternary_split_k_stage1_{M}_{K}_{N}_{S}_{group_size}",
+                        input_names=["activations", "interleaved_weights"],
+                        output_names=["partial_output"],
+                        source=s1_src,
+                        header=_LUT_HEADER
+                    )
+                s2_key = ("split_k_stage2", M, N, S)
+                if s2_key not in _KERNEL_CACHE:
+                    _, s2_src = get_elastic_split_k_sources(M, K, N, S, group_size)
+                    _KERNEL_CACHE[s2_key] = fast.metal_kernel(
+                        name=f"ternary_split_k_stage2_{M}_{N}_{S}",
+                        input_names=["partial_output"],
+                        output_names=["output"],
+                        source=s2_src
+                    )
+
+                grid_x = ((N + 127) // 128) * 128
+                p = _KERNEL_CACHE[s1_key](
+                    inputs=[x_flat, w_packed],
+                    grid=(grid_x, S, M),
+                    threadgroup=(128, 1, 1),
+                    output_shapes=[(M, S, N)],
+                    output_dtypes=[mx.float32]
+                )[0]
+
+                if N % 4 == 0:
+                    tg_s2 = min(256, max(32, N // 4))
+                    grid_s2 = (((N // 4) + tg_s2 - 1) // tg_s2) * tg_s2
+                else:
+                    tg_s2 = min(256, max(32, N))
+                    grid_s2 = ((N + tg_s2 - 1) // tg_s2) * tg_s2
+
+                out = _KERNEL_CACHE[s2_key](
+                    inputs=[p],
+                    grid=(grid_s2, M, 1),
+                    threadgroup=(tg_s2, 1, 1),
+                    output_shapes=[(M, N)],
+                    output_dtypes=[mx.float16]
                 )
-                _KERNEL_CACHE[shape_key] = kernel
+                res = out[0]
+            else:
+                # 0-barrier SIMD-warp grid (S=1)
+                kernel_type = "simd_gemv"
+                shape_key = (kernel_type, M, K, N, group_size)
+                if shape_key not in _KERNEL_CACHE:
+                    s1_src, _ = get_elastic_split_k_sources(M, K, N, 1, group_size)
+                    _KERNEL_CACHE[shape_key] = fast.metal_kernel(
+                        name=f"ternary_{kernel_type}_{M}_{K}_{N}_{group_size}",
+                        input_names=["activations", "interleaved_weights"],
+                        output_names=["output"],
+                        source=s1_src,
+                        header=_LUT_HEADER
+                    )
+                grid_x = ((N + 127) // 128) * 128
+                out = _KERNEL_CACHE[shape_key](
+                    inputs=[x_flat, w_packed],
+                    grid=(grid_x, 1, M),
+                    threadgroup=(128, 1, 1),
+                    output_shapes=[(M, N)],
+                    output_dtypes=[mx.float16]
+                )
+                res = out[0]
 
-            tg_size = 128
-            grid_x = ((N + tg_size - 1) // tg_size) * tg_size
-            grid = (grid_x, M, 1)
-            threadgroup = (tg_size, 1, 1)
-            out_shapes = [(M, N)]
-
-    out = _KERNEL_CACHE[shape_key](
-        inputs=[x_flat, w_packed],
-        grid=grid,
-        threadgroup=threadgroup,
-        output_shapes=out_shapes,
-        output_dtypes=[mx.float16]
-    )
-    
-    res = out[0]
     if len(orig_shape) > 2:
         return res.reshape(*orig_shape[:-1], N)
     elif len(orig_shape) == 1:
