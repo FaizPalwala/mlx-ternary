@@ -1,5 +1,5 @@
 from .ops import ternary_matmul, ternary_swiglu
-from .layers import TernaryLinear, BonsaiTernaryLinear
+from .layers import TernaryLinear, BonsaiTernaryLinear, TernarySwiGLU
 from .quantize import pack_interleaved
 from . import speculative
 
@@ -11,6 +11,7 @@ __all__ = [
     "ternary_swiglu",
     "TernaryLinear",
     "BonsaiTernaryLinear",
+    "TernarySwiGLU",
     "pack_interleaved",
     "speculative",
 ]
