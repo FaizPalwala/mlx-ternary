@@ -467,6 +467,182 @@ def get_elastic_split_k_sources(M: int, K: int, N: int, S: int, group_size: int 
     return stage1_source, stage2_source
 
 
+def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> str:
+    """
+    Generate Metal Shading Language source for single-pass fused Gate + Up + SiLU contraction.
+
+    Computes: SiLU(x @ w_gate) * (x @ w_up) in a single kernel pass.
+    Reuses loaded activation vector chunks in registers across dual-issue ALU pipelines,
+    evaluating the SiLU activation and product directly in registers before committing to DRAM.
+
+    Args:
+        M: Activation batch/row count.
+        K: Contraction dimension.
+        N: Output dimension.
+        group_size: Quantization group size (128 or 150).
+
+    Returns:
+        str: Metal Shading Language source for fused SwiGLU.
+    """
+    source = f"""
+    uint col = thread_position_in_grid.x;
+    uint row = thread_position_in_grid.y;
+
+    if (col >= {N} || row >= {M}) return;
+
+    uint K_blocks = {K} / {group_size};
+    half acc_gate = 0;
+    half acc_up = 0;
+
+    device const half* act_block = activations + row * {K};
+    device const uint4* w_gate_ptr = ((device const uint4*)gate_weights) + col * 2;
+    device const uint4* w_up_ptr = ((device const uint4*)up_weights) + col * 2;
+    uint w_stride = {N} * 2;
+
+    // Asynchronous prologue: pre-load block 0 weights for both Gate and Up
+    uint4 cur_g0 = w_gate_ptr[0];
+    uint4 cur_g1 = w_gate_ptr[1];
+    w_gate_ptr += w_stride;
+
+    uint4 cur_u0 = w_up_ptr[0];
+    uint4 cur_u1 = w_up_ptr[1];
+    w_up_ptr += w_stride;
+
+    for (uint k_block = 0; k_block < K_blocks; k_block++) {{
+        // Asynchronously issue prefetch for next block weights
+        uint4 next_g0 = uint4(0), next_g1 = uint4(0);
+        uint4 next_u0 = uint4(0), next_u1 = uint4(0);
+        if (k_block + 1 < K_blocks) {{
+            next_g0 = w_gate_ptr[0];
+            next_g1 = w_gate_ptr[1];
+            w_gate_ptr += w_stride;
+
+            next_u0 = w_up_ptr[0];
+            next_u1 = w_up_ptr[1];
+            w_up_ptr += w_stride;
+        }}
+
+        half scale_g = as_type<half>((uint16_t)(cur_g0.x & 0xFFFF));
+        half scale_u = as_type<half>((uint16_t)(cur_u0.x & 0xFFFF));
+
+        struct PackedBlock {{ uint4 v0, v1; }};
+        PackedBlock blk_g = {{cur_g0, cur_g1}};
+        PackedBlock blk_u = {{cur_u0, cur_u1}};
+        thread const uchar* bytes_g = (thread const uchar*)&blk_g;
+        thread const uchar* bytes_u = (thread const uchar*)&blk_u;
+    """
+
+    if group_size == 128:
+        source += f"""
+        half g_acc0 = 0, g_acc1 = 0, g_acc2 = 0, g_acc3 = 0;
+        half u_acc0 = 0, u_acc1 = 0, u_acc2 = 0, u_acc3 = 0;
+
+        device const half4* act_vec = (device const half4*)act_block;
+
+        #pragma unroll(6)
+        for (uint c = 0; c < 6; c++) {{
+            // Load activation chunk once into registers for both projections
+            half4 x0 = act_vec[c * 5 + 0];
+            half4 x1 = act_vec[c * 5 + 1];
+            half4 x2 = act_vec[c * 5 + 2];
+            half4 x3 = act_vec[c * 5 + 3];
+            half4 x4 = act_vec[c * 5 + 4];
+
+            // 1. Gate Chunk FMAs
+            uint8_t gb0 = bytes_g[2 + c * 4 + 0];
+            uint8_t gb1 = bytes_g[2 + c * 4 + 1];
+            uint8_t gb2 = bytes_g[2 + c * 4 + 2];
+            uint8_t gb3 = bytes_g[2 + c * 4 + 3];
+
+            half4 gw0_low = base3_lut_low[gb0]; half gw0_high = base3_lut_high[gb0];
+            half4 gw1_low = base3_lut_low[gb1]; half gw1_high = base3_lut_high[gb1];
+            half4 gw2_low = base3_lut_low[gb2]; half gw2_high = base3_lut_high[gb2];
+            half4 gw3_low = base3_lut_low[gb3]; half gw3_high = base3_lut_high[gb3];
+
+            g_acc0 += dot(x0, gw0_low) + x1.x * gw0_high;
+            g_acc1 += dot(x1.yzw, gw1_low.xyz) + x2.x * gw1_low.w + x2.y * gw1_high;
+            g_acc2 += dot(x2.zw, gw2_low.xy) + dot(x3.xyz, half3(gw2_low.z, gw2_low.w, gw2_high));
+            g_acc3 += x3.w * gw3_low.x + dot(x4, half4(gw3_low.y, gw3_low.z, gw3_low.w, gw3_high));
+
+            // 2. Up Chunk FMAs (reuses loaded x0..x4, dual-issue with Gate)
+            uint8_t ub0 = bytes_u[2 + c * 4 + 0];
+            uint8_t ub1 = bytes_u[2 + c * 4 + 1];
+            uint8_t ub2 = bytes_u[2 + c * 4 + 2];
+            uint8_t ub3 = bytes_u[2 + c * 4 + 3];
+
+            half4 uw0_low = base3_lut_low[ub0]; half uw0_high = base3_lut_high[ub0];
+            half4 uw1_low = base3_lut_low[ub1]; half uw1_high = base3_lut_high[ub1];
+            half4 uw2_low = base3_lut_low[ub2]; half uw2_high = base3_lut_high[ub2];
+            half4 uw3_low = base3_lut_low[ub3]; half uw3_high = base3_lut_high[ub3];
+
+            u_acc0 += dot(x0, uw0_low) + x1.x * uw0_high;
+            u_acc1 += dot(x1.yzw, uw1_low.xyz) + x2.x * uw1_low.w + x2.y * uw1_high;
+            u_acc2 += dot(x2.zw, uw2_low.xy) + dot(x3.xyz, half3(uw2_low.z, uw2_low.w, uw2_high));
+            u_acc3 += x3.w * uw3_low.x + dot(x4, half4(uw3_low.y, uw3_low.z, uw3_low.w, uw3_high));
+        }}
+
+        half4 tail0 = act_vec[30];
+        half4 tail1 = act_vec[31];
+
+        // Tail Gate
+        uint8_t gb24 = bytes_g[2 + 24];
+        uint8_t gb25 = bytes_g[2 + 25];
+        g_acc0 += dot(tail0, base3_lut_low[gb24]) + tail1.x * base3_lut_high[gb24];
+        g_acc1 += dot(tail1.yzw, base3_lut_low[gb25].xyz);
+
+        // Tail Up
+        uint8_t ub24 = bytes_u[2 + 24];
+        uint8_t ub25 = bytes_u[2 + 25];
+        u_acc0 += dot(tail0, base3_lut_low[ub24]) + tail1.x * base3_lut_high[ub24];
+        u_acc1 += dot(tail1.yzw, base3_lut_low[ub25].xyz);
+
+        acc_gate += ((g_acc0 + g_acc1) + (g_acc2 + g_acc3)) * scale_g;
+        acc_up   += ((u_acc0 + u_acc1) + (u_acc2 + u_acc3)) * scale_u;
+
+        act_block += 128;
+        cur_g0 = next_g0; cur_g1 = next_g1;
+        cur_u0 = next_u0; cur_u1 = next_u1;
+        """
+    else:
+        source += f"""
+        half block_acc_g = 0;
+        half block_acc_u = 0;
+
+        #pragma unroll(30)
+        for (uint i = 0; i < 30; i++) {{
+            uint curr_x = i * 5;
+            half4 x_low = half4(act_block[curr_x], act_block[curr_x + 1], act_block[curr_x + 2], act_block[curr_x + 3]);
+            half x_high = act_block[curr_x + 4];
+
+            uint8_t gb = bytes_g[2 + i];
+            half4 gw_low = base3_lut_low[gb]; half gw_high = base3_lut_high[gb];
+            block_acc_g += dot(x_low, gw_low) + x_high * gw_high;
+
+            uint8_t ub = bytes_u[2 + i];
+            half4 uw_low = base3_lut_low[ub]; half uw_high = base3_lut_high[ub];
+            block_acc_u += dot(x_low, uw_low) + x_high * uw_high;
+        }}
+
+        acc_gate += block_acc_g * scale_g;
+        acc_up   += block_acc_u * scale_u;
+
+        act_block += 150;
+        cur_g0 = next_g0; cur_g1 = next_g1;
+        cur_u0 = next_u0; cur_u1 = next_u1;
+        """
+
+    source += f"""
+    }}
+
+    // In-register SiLU(acc_gate) * acc_up evaluation
+    float g = (float)acc_gate;
+    float silu_g = g / (1.0f + metal::exp(-g));
+    half out_val = (half)(silu_g * (float)acc_up);
+    output[row * {N} + col] = out_val;
+    """
+    return source
+
+
 def get_gemm_source(M, K, N, G_SIZE):
     num_bytes = 26 if G_SIZE == 128 else 30
     k_tile = 128 if G_SIZE == 128 else 152
@@ -752,6 +928,71 @@ def ternary_matmul(x: mx.array, w_packed: mx.array, group_size: int = None) -> m
                     output_dtypes=[mx.float16]
                 )
                 res = out[0]
+
+    if len(orig_shape) > 2:
+        return res.reshape(*orig_shape[:-1], N)
+    elif len(orig_shape) == 1:
+        return res.reshape(N)
+    return res
+
+
+def ternary_swiglu(
+    x: mx.array,
+    w_gate_packed: mx.array,
+    w_up_packed: mx.array,
+    group_size: int = None
+) -> mx.array:
+    """
+    Fused Ternary SwiGLU activation and projection: SiLU(x @ w_gate) * (x @ w_up).
+
+    Traverses both Gate and Up packed ternary weights in a single kernel pass,
+    reusing loaded activation chunks across dual-issue ALU pipelines with an in-register
+    SiLU product epilogue.
+
+    Args:
+        x: Input activations of shape (..., K).
+        w_gate_packed: Gate projection packed weights of shape (K_blocks, N, 32).
+        w_up_packed: Up projection packed weights of shape (K_blocks, N, 32).
+        group_size: Scale group size (128 or 150). Inferred if None.
+
+    Returns:
+        mx.array: SwiGLU output activations of shape (..., N).
+    """
+    orig_shape = x.shape
+    x_flat = x.reshape(-1, orig_shape[-1])
+    if x_flat.dtype != mx.float16:
+        x_flat = x_flat.astype(mx.float16)
+
+    M = x_flat.shape[0]
+    K = x_flat.shape[1]
+    N = w_gate_packed.shape[1]
+    K_blocks = w_gate_packed.shape[0]
+
+    if group_size is None:
+        group_size = K // K_blocks
+
+    shape_key = ("fused_swiglu", M, K, N, group_size)
+    if shape_key not in _KERNEL_CACHE:
+        source = get_fused_swiglu_source(M, K, N, group_size)
+        kernel = fast.metal_kernel(
+            name=f"ternary_fused_swiglu_{M}_{K}_{N}_{group_size}",
+            input_names=["activations", "gate_weights", "up_weights"],
+            output_names=["output"],
+            source=source,
+            header=_LUT_HEADER
+        )
+        _KERNEL_CACHE[shape_key] = kernel
+
+    tg_x = 128
+    grid_x = ((N + tg_x - 1) // tg_x) * tg_x
+    out = _KERNEL_CACHE[shape_key](
+        inputs=[x_flat, w_gate_packed, w_up_packed],
+        grid=(grid_x, M, 1),
+        threadgroup=(tg_x, 1, 1),
+        output_shapes=[(M, N)],
+        output_dtypes=[mx.float16]
+    )
+    res = out[0]
 
     if len(orig_shape) > 2:
         return res.reshape(*orig_shape[:-1], N)
