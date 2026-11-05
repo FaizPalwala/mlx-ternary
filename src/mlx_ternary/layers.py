@@ -352,7 +352,7 @@ class TernaryQKV(nn.Module):
     """
     def __init__(
         self,
-        input_dims_or_qkv,
+        input_dims_or_qkv=None,
         q_dim: int = None,
         k_dim: int = None,
         v_dim: int = None,
@@ -361,6 +361,7 @@ class TernaryQKV(nn.Module):
         pad_k: int = 0,
         block: int = 0,
         signs: Optional[mx.array] = None,
+        in_features: int = None,
     ):
         super().__init__()
         self.group_size = group_size
@@ -372,6 +373,9 @@ class TernaryQKV(nn.Module):
         self.block = block
         self.signs = signs
 
+        if in_features is not None:
+            input_dims_or_qkv = in_features
+
         if isinstance(input_dims_or_qkv, mx.array):
             self.qkv_packed = input_dims_or_qkv
             self.input_dims = None
@@ -379,12 +383,23 @@ class TernaryQKV(nn.Module):
             self.output_dims = total_n
         else:
             self.input_dims = input_dims_or_qkv
-            assert q_dim is not None and k_dim is not None and v_dim is not None
-            self.output_dims = q_dim + k_dim + v_dim
-            self.pad_k = (group_size - (self.input_dims % group_size)) % group_size
-            padded_k = self.input_dims + self.pad_k
-            blocks = padded_k // group_size
-            self.qkv_packed = mx.zeros((blocks, self.output_dims, 32), dtype=mx.uint8)
+            if q_dim is not None and k_dim is not None and v_dim is not None:
+                self.output_dims = q_dim + k_dim + v_dim
+            else:
+                self.output_dims = None
+            if self.input_dims is not None and self.output_dims is not None:
+                self.pad_k = (group_size - (self.input_dims % group_size)) % group_size
+                padded_k = self.input_dims + self.pad_k
+                blocks = padded_k // group_size
+                self.qkv_packed = mx.zeros((blocks, self.output_dims, 32), dtype=mx.uint8)
+            else:
+                self.qkv_packed = None
+
+    def __setattr__(self, key: str, val):
+        if key == "w_qkv":
+            super().__setattr__("qkv_packed", val)
+            return
+        super().__setattr__(key, val)
 
     @classmethod
     def from_raw(
@@ -455,7 +470,8 @@ class TernaryQKV(nn.Module):
         if self.pad_k > 0:
             *batch, k = x.shape
             x = mx.concatenate([x, mx.zeros((*batch, self.pad_k), dtype=x.dtype)], axis=-1)
-        out = ternary_fused_qkv(x, self.qkv_packed, group_size=self.group_size)
+        packed = self.qkv_packed if self.qkv_packed is not None else getattr(self, "w_qkv", None)
+        out = ternary_fused_qkv(x, packed, group_size=self.group_size)
         if self.split and self.q_dim is not None and self.k_dim is not None:
             q = out[..., :self.q_dim]
             k = out[..., self.q_dim:self.q_dim + self.k_dim]

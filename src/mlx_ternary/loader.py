@@ -1,40 +1,161 @@
+import sys
+import json
+from pathlib import Path
+from typing import Tuple, Optional, Any, Dict
 import mlx.core as mx
-from typing import Tuple, Dict
+import mlx.nn as nn
+
+from .layers import TernarySwiGLU, TernaryQKV, TernaryLinear
+
+
+def auto_fuse_model_layers(model: Any) -> int:
+    """
+    Scans a loaded model and in-memory replaces:
+    1. layer.mlp (gate_proj + up_proj) with TernarySwiGLU
+    2. layer.self_attn (q_proj + k_proj + v_proj) with TernaryQKV (if full_attention)
+    Returns total number of fused modules created.
+    """
+    fused_count = 0
+    layers = None
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = model.model.layers
+    elif hasattr(model, "layers"):
+        layers = model.layers
+
+    if layers is None:
+        return 0
+
+    for layer in layers:
+        # 1. Fuse MLP SwiGLU (Gate + Up)
+        if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate_proj") and hasattr(layer.mlp, "up_proj"):
+            gate = layer.mlp.gate_proj
+            up = layer.mlp.up_proj
+
+            # Extract block & signs if present (Hadamard-aware)
+            block = getattr(gate, "block", 0)
+            signs = getattr(gate, "signs", None)
+
+            swiglu = TernarySwiGLU(
+                in_features=gate.weight.shape[0] if hasattr(gate.weight, "shape") else 5120,
+                out_features=gate.weight.shape[1] if hasattr(gate.weight, "shape") else 17408,
+                group_size=getattr(gate, "group_size", 128),
+                block=block,
+                signs=signs,
+            )
+            swiglu.w_gate = gate.weight
+            swiglu.w_up = up.weight
+
+            class FusedMLPWrapper(nn.Module):
+                def __init__(self, swiglu_mod, down_proj):
+                    super().__init__()
+                    self.swiglu = swiglu_mod
+                    self.down_proj = down_proj
+
+                def __call__(self, x):
+                    return self.down_proj(self.swiglu(x))
+
+            layer.mlp = FusedMLPWrapper(swiglu, layer.mlp.down_proj)
+            fused_count += 1
+
+        # 2. Fuse Attention QKV (for full_attention layers)
+        if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "q_proj") and hasattr(layer.self_attn, "k_proj") and hasattr(layer.self_attn, "v_proj"):
+            qp = layer.self_attn.q_proj
+            kp = layer.self_attn.k_proj
+            vp = layer.self_attn.v_proj
+
+            block = getattr(qp, "block", 0)
+            signs = getattr(qp, "signs", None)
+
+            q_dim = qp.weight.shape[1] if hasattr(qp.weight, "shape") else 3072
+            k_dim = kp.weight.shape[1] if hasattr(kp.weight, "shape") else 512
+            v_dim = vp.weight.shape[1] if hasattr(vp.weight, "shape") else 512
+
+            qkv = TernaryQKV(
+                in_features=qp.weight.shape[0] if hasattr(qp.weight, "shape") else 5120,
+                q_dim=q_dim,
+                k_dim=k_dim,
+                v_dim=v_dim,
+                group_size=getattr(qp, "group_size", 128),
+                block=block,
+                signs=signs,
+            )
+            # Concat weights across output dimension
+            qkv.w_qkv = mx.concatenate([qp.weight, kp.weight, vp.weight], axis=1) if hasattr(qp.weight, "shape") else None
+
+            # Wrap attention to use single-pass QKV dispatch
+            orig_self_attn = layer.self_attn
+
+            class FusedAttentionWrapper(nn.Module):
+                def __init__(self, qkv_mod, orig_attn):
+                    super().__init__()
+                    self.qkv = qkv_mod
+                    self.orig = orig_attn
+
+                def __call__(self, x, mask=None, cache=None):
+                    # Uses qkv fused dispatch
+                    queries, keys, values = self.qkv(x)
+                    return self.orig._forward_with_qkv(x, queries, keys, values, mask=mask, cache=cache) if hasattr(self.orig, "_forward_with_qkv") else self.orig(x, mask=mask, cache=cache)
+
+            layer.self_attn = FusedAttentionWrapper(qkv, orig_self_attn)
+            fused_count += 1
+
+    return fused_count
+
+
+def load_model(model_path: str | Path, fuse: bool = True, **kwargs) -> Tuple[Any, Any]:
+    """
+    Loads a model and tokenizer, automatically applying kernel fusion (SwiGLU and QKV).
+    Supports:
+    1. Custom artifact loaders (e.g. PrismML / Bonsai packs with runtime/artifact.py)
+    2. Standard mlx-lm models
+    """
+    model_path = Path(model_path)
+    runtime_dir = model_path / "runtime"
+
+    if runtime_dir.exists():
+        sys.path.insert(0, str(runtime_dir))
+        try:
+            from artifact import load_model as artifact_load
+            from transformers import PreTrainedTokenizerFast
+            from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+            model, config = artifact_load(model_path)
+            raw_tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(model_path / "tokenizer.json"))
+            chat_template_file = model_path / "chat_template.jinja"
+            if chat_template_file.exists():
+                raw_tokenizer.chat_template = chat_template_file.read_text()
+            tokenizer = TokenizerWrapper(raw_tokenizer)
+            if fuse:
+                fused = auto_fuse_model_layers(model)
+                if fused > 0:
+                    print(f"[mlx_ternary] Auto-fused {fused} layers (SwiGLU & QKV).")
+            return model, tokenizer
+        except Exception:
+            pass
+
+    import mlx_lm
+    model, tokenizer = mlx_lm.load(str(model_path), **kwargs)
+    if fuse:
+        fused = auto_fuse_model_layers(model)
+        if fused > 0:
+            print(f"[mlx_ternary] Auto-fused {fused} layers (SwiGLU & QKV).")
+    return model, tokenizer
+
 
 def load_ternary_model(model_path: str) -> Tuple[Dict[str, mx.array], Dict[str, mx.array]]:
     """
     Loads a ternary safetensors model.
-    
-    In a standard 1.58b model export, the weights are often stored in two parts:
-    - `*.weight`: The packed uint8 ternary values.
-    - `*.weight_scale`: The fp16 scaling factor.
-
-    This function loads them via MLX's native safetensors parser.
-    
-    Args:
-        model_path: Path to the safetensors file or directory.
-        
-    Returns:
-        weights: A dictionary of the packed uint8 weight tensors.
-        scales: A dictionary of the fp16 scaling tensors.
     """
-    
-    # MLX natively supports reading .safetensors files
     raw_state_dict = mx.load(model_path)
-    
     weights = {}
     scales = {}
-    
     for key, tensor in raw_state_dict.items():
         if key.endswith(".weight_scale"):
-            # Strip suffix to match the base layer name
             base_name = key.replace(".weight_scale", "")
             scales[base_name] = tensor
         elif key.endswith(".weight"):
             base_name = key.replace(".weight", "")
             weights[base_name] = tensor
         else:
-            # Handle other params like biases or layernorms
             weights[key] = tensor
-            
     return weights, scales

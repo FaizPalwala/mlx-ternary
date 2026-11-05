@@ -151,7 +151,11 @@ def generate_cli(
         model, tokenizer = custom_loader()
     else:
         from mlx_lm import load
+        from .loader import auto_fuse_model_layers
         model, tokenizer = load(str(model_dir))
+        fused = auto_fuse_model_layers(model)
+        if fused > 0 and verbose:
+            print(f"[mlx_ternary] Auto-fused {fused} projection layers.")
 
     for chunk in generate_speculative(
         model=model,

@@ -17,6 +17,11 @@ def setup_model_loader(model_path: Path, kv_bits: int = None, kv_group_size: int
                 print(f"[mlx_ternary] Loading Ternary Model from {model_path}...")
                 model, config = load_model(model_path)
                 
+                from .loader import auto_fuse_model_layers
+                fused = auto_fuse_model_layers(model)
+                if fused > 0:
+                    print(f"[mlx_ternary] Auto-fused {fused} projection layers.")
+                
                 if kv_bits in (4, 8) or max_kv_size is not None:
                     def make_custom_cache():
                         c = []
