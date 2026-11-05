@@ -149,19 +149,26 @@ class TernarySwiGLU(nn.Module):
     """
     def __init__(
         self,
-        input_dims_or_gate,
+        input_dims_or_gate=None,
         output_dims_or_up=None,
         output_dims: int = None,
         group_size: int = 128,
         pad_k: int = 0,
         block: int = 0,
         signs: Optional[mx.array] = None,
+        in_features: int = None,
+        out_features: int = None,
     ):
         super().__init__()
         self.group_size = group_size
         self.pad_k = pad_k
         self.block = block
         self.signs = signs
+
+        if in_features is not None:
+            input_dims_or_gate = in_features
+        if out_features is not None:
+            output_dims_or_up = out_features
 
         if isinstance(input_dims_or_gate, mx.array) and isinstance(output_dims_or_up, mx.array):
             self.gate_packed = input_dims_or_gate
@@ -171,11 +178,24 @@ class TernarySwiGLU(nn.Module):
         else:
             self.input_dims = input_dims_or_gate
             self.output_dims = output_dims if output_dims is not None else output_dims_or_up
-            self.pad_k = (group_size - (self.input_dims % group_size)) % group_size
-            padded_k = self.input_dims + self.pad_k
-            blocks = padded_k // group_size
-            self.gate_packed = mx.zeros((blocks, self.output_dims, 32), dtype=mx.uint8)
-            self.up_packed = mx.zeros((blocks, self.output_dims, 32), dtype=mx.uint8)
+            if self.input_dims is not None and self.output_dims is not None:
+                self.pad_k = (group_size - (self.input_dims % group_size)) % group_size
+                padded_k = self.input_dims + self.pad_k
+                blocks = padded_k // group_size
+                self.gate_packed = mx.zeros((blocks, self.output_dims, 32), dtype=mx.uint8)
+                self.up_packed = mx.zeros((blocks, self.output_dims, 32), dtype=mx.uint8)
+            else:
+                self.gate_packed = None
+                self.up_packed = None
+
+    def __setattr__(self, key: str, val):
+        if key == "w_gate":
+            super().__setattr__("gate_packed", val)
+            return
+        elif key == "w_up":
+            super().__setattr__("up_packed", val)
+            return
+        super().__setattr__(key, val)
 
     def quantize_from_raw(self, w_gate_raw: mx.array, w_up_raw: mx.array):
         """
@@ -228,7 +248,9 @@ class TernarySwiGLU(nn.Module):
         if self.pad_k > 0:
             *batch, k = x.shape
             x = mx.concatenate([x, mx.zeros((*batch, self.pad_k), dtype=x.dtype)], axis=-1)
-        return ternary_swiglu(x, self.gate_packed, self.up_packed, group_size=self.group_size)
+        gate = self.gate_packed if self.gate_packed is not None else getattr(self, "w_gate", None)
+        up = self.up_packed if self.up_packed is not None else getattr(self, "w_up", None)
+        return ternary_swiglu(x, gate, up, group_size=self.group_size)
 
 
 class TernaryFusedKV(nn.Module):
