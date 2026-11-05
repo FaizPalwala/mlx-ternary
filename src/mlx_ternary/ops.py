@@ -643,6 +643,303 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
     return source
 
 
+def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
+    """
+    Generate Metal Shading Language source for single-pass fused Key + Value contraction.
+
+    Reuses loaded activation vector chunks in registers across dual-issue ALU pipelines,
+    evaluating both projections concurrently in a single kernel dispatch.
+
+    Args:
+        M: Activation batch/row count.
+        K: Contraction dimension.
+        N: Output dimension for each of K and V.
+        group_size: Quantization group size (128 or 150).
+
+    Returns:
+        str: Metal Shading Language source for fused KV.
+    """
+    source = f"""
+    uint col = thread_position_in_grid.x;
+    uint row = thread_position_in_grid.y;
+
+    if (col >= {N} || row >= {M}) return;
+
+    uint K_blocks = {K} / {group_size};
+    half acc_k = 0;
+    half acc_v = 0;
+
+    device const half* act_block = activations + row * {K};
+    device const uint4* w_k_ptr = ((device const uint4*)k_weights) + col * 2;
+    device const uint4* w_v_ptr = ((device const uint4*)v_weights) + col * 2;
+    uint w_stride = {N} * 2;
+
+    // Asynchronous prologue: pre-load block 0 weights for both K and V
+    uint4 cur_k0 = w_k_ptr[0];
+    uint4 cur_k1 = w_k_ptr[1];
+    w_k_ptr += w_stride;
+
+    uint4 cur_v0 = w_v_ptr[0];
+    uint4 cur_v1 = w_v_ptr[1];
+    w_v_ptr += w_stride;
+
+    for (uint k_block = 0; k_block < K_blocks; k_block++) {{
+        // Asynchronously prefetch next block weights
+        uint4 next_k0 = uint4(0), next_k1 = uint4(0);
+        uint4 next_v0 = uint4(0), next_v1 = uint4(0);
+        if (k_block + 1 < K_blocks) {{
+            next_k0 = w_k_ptr[0];
+            next_k1 = w_k_ptr[1];
+            w_k_ptr += w_stride;
+
+            next_v0 = w_v_ptr[0];
+            next_v1 = w_v_ptr[1];
+            w_v_ptr += w_stride;
+        }}
+
+        half scale_k = as_type<half>((uint16_t)(cur_k0.x & 0xFFFF));
+        half scale_v = as_type<half>((uint16_t)(cur_v0.x & 0xFFFF));
+
+        struct PackedBlock {{ uint4 v0, v1; }};
+        PackedBlock blk_k = {{cur_k0, cur_k1}};
+        PackedBlock blk_v = {{cur_v0, cur_v1}};
+        thread const uchar* bytes_k = (thread const uchar*)&blk_k;
+        thread const uchar* bytes_v = (thread const uchar*)&blk_v;
+    """
+
+    if group_size == 128:
+        source += f"""
+        half k_acc0 = 0, k_acc1 = 0, k_acc2 = 0, k_acc3 = 0;
+        half v_acc0 = 0, v_acc1 = 0, v_acc2 = 0, v_acc3 = 0;
+
+        device const half4* act_vec = (device const half4*)act_block;
+
+        #pragma unroll(6)
+        for (uint c = 0; c < 6; c++) {{
+            half4 x0 = act_vec[c * 5 + 0];
+            half4 x1 = act_vec[c * 5 + 1];
+            half4 x2 = act_vec[c * 5 + 2];
+            half4 x3 = act_vec[c * 5 + 3];
+            half4 x4 = act_vec[c * 5 + 4];
+
+            // 1. K Chunk FMAs
+            uint8_t kb0 = bytes_k[2 + c * 4 + 0];
+            uint8_t kb1 = bytes_k[2 + c * 4 + 1];
+            uint8_t kb2 = bytes_k[2 + c * 4 + 2];
+            uint8_t kb3 = bytes_k[2 + c * 4 + 3];
+
+            half4 kw0_low = base3_lut_low[kb0]; half kw0_high = base3_lut_high[kb0];
+            half4 kw1_low = base3_lut_low[kb1]; half kw1_high = base3_lut_high[kb1];
+            half4 kw2_low = base3_lut_low[kb2]; half kw2_high = base3_lut_high[kb2];
+            half4 kw3_low = base3_lut_low[kb3]; half kw3_high = base3_lut_high[kb3];
+
+            k_acc0 += dot(x0, kw0_low) + x1.x * kw0_high;
+            k_acc1 += dot(x1.yzw, kw1_low.xyz) + x2.x * kw1_low.w + x2.y * kw1_high;
+            k_acc2 += dot(x2.zw, kw2_low.xy) + dot(x3.xyz, half3(kw2_low.z, kw2_low.w, kw2_high));
+            k_acc3 += x3.w * kw3_low.x + dot(x4, half4(kw3_low.y, kw3_low.z, kw3_low.w, kw3_high));
+
+            // 2. V Chunk FMAs (reuses loaded x0..x4, dual-issue with K)
+            uint8_t vb0 = bytes_v[2 + c * 4 + 0];
+            uint8_t vb1 = bytes_v[2 + c * 4 + 1];
+            uint8_t vb2 = bytes_v[2 + c * 4 + 2];
+            uint8_t vb3 = bytes_v[2 + c * 4 + 3];
+
+            half4 vw0_low = base3_lut_low[vb0]; half vw0_high = base3_lut_high[vb0];
+            half4 vw1_low = base3_lut_low[vb1]; half vw1_high = base3_lut_high[vb1];
+            half4 vw2_low = base3_lut_low[vb2]; half vw2_high = base3_lut_high[vb2];
+            half4 vw3_low = base3_lut_low[vb3]; half vw3_high = base3_lut_high[vb3];
+
+            v_acc0 += dot(x0, vw0_low) + x1.x * vw0_high;
+            v_acc1 += dot(x1.yzw, vw1_low.xyz) + x2.x * vw1_low.w + x2.y * vw1_high;
+            v_acc2 += dot(x2.zw, vw2_low.xy) + dot(x3.xyz, half3(vw2_low.z, vw2_low.w, vw2_high));
+            v_acc3 += x3.w * vw3_low.x + dot(x4, half4(vw3_low.y, vw3_low.z, vw3_low.w, vw3_high));
+        }}
+
+        half4 tail0 = act_vec[30];
+        half4 tail1 = act_vec[31];
+
+        // Tail K
+        uint8_t kb24 = bytes_k[2 + 24];
+        uint8_t kb25 = bytes_k[2 + 25];
+        k_acc0 += dot(tail0, base3_lut_low[kb24]) + tail1.x * base3_lut_high[kb24];
+        k_acc1 += dot(tail1.yzw, base3_lut_low[kb25].xyz);
+
+        // Tail V
+        uint8_t vb24 = bytes_v[2 + 24];
+        uint8_t vb25 = bytes_v[2 + 25];
+        v_acc0 += dot(tail0, base3_lut_low[vb24]) + tail1.x * base3_lut_high[vb24];
+        v_acc1 += dot(tail1.yzw, base3_lut_low[vb25].xyz);
+
+        acc_k += ((k_acc0 + k_acc1) + (k_acc2 + k_acc3)) * scale_k;
+        acc_v += ((v_acc0 + v_acc1) + (v_acc2 + v_acc3)) * scale_v;
+
+        act_block += 128;
+        cur_k0 = next_k0; cur_k1 = next_k1;
+        cur_v0 = next_v0; cur_v1 = next_v1;
+        """
+    else:
+        source += f"""
+        half block_acc_k = 0;
+        half block_acc_v = 0;
+
+        #pragma unroll(30)
+        for (uint i = 0; i < 30; i++) {{
+            uint curr_x = i * 5;
+            half4 x_low = half4(act_block[curr_x], act_block[curr_x + 1], act_block[curr_x + 2], act_block[curr_x + 3]);
+            half x_high = act_block[curr_x + 4];
+
+            uint8_t kb = bytes_k[2 + i];
+            half4 kw_low = base3_lut_low[kb]; half kw_high = base3_lut_high[kb];
+            block_acc_k += dot(x_low, kw_low) + x_high * kw_high;
+
+            uint8_t vb = bytes_v[2 + i];
+            half4 vw_low = base3_lut_low[vb]; half vw_high = base3_lut_high[vb];
+            block_acc_v += dot(x_low, vw_low) + x_high * vw_high;
+        }}
+
+        acc_k += block_acc_k * scale_k;
+        acc_v += block_acc_v * scale_v;
+
+        act_block += 150;
+        cur_k0 = next_k0; cur_k1 = next_k1;
+        cur_v0 = next_v0; cur_v1 = next_v1;
+        """
+
+    source += f"""
+    }}
+
+    out_k[row * {N} + col] = acc_k;
+    out_v[row * {N} + col] = acc_v;
+    """
+    return source
+
+
+def get_fused_qkv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
+    """
+    Generate Metal Shading Language source for single-pass unified QKV projection.
+
+    Evaluates concatenated [Q, K, V] projections in a single 0-barrier wide GEMV dispatch
+    with 4-way ILP accumulators and asynchronous weight prefetching.
+
+    Args:
+        M: Activation batch/row count.
+        K: Contraction dimension.
+        N: Total output dimension (e.g. N_q + N_k + N_v).
+        group_size: Quantization group size (128 or 150).
+
+    Returns:
+        str: Metal Shading Language source for unified QKV.
+    """
+    source = f"""
+    uint col = thread_position_in_grid.x;
+    uint row = thread_position_in_grid.y;
+
+    if (col >= {N} || row >= {M}) return;
+
+    uint K_blocks = {K} / {group_size};
+    half acc = 0;
+
+    device const half* act_block = activations + row * {K};
+    device const uint4* w_block = ((device const uint4*)interleaved_weights) + col * 2;
+    uint w_stride = {N} * 2;
+
+    uint4 cur_vec0 = w_block[0];
+    uint4 cur_vec1 = w_block[1];
+    w_block += w_stride;
+
+    for (uint k_block = 0; k_block < K_blocks; k_block++) {{
+        uint4 next_vec0 = uint4(0);
+        uint4 next_vec1 = uint4(0);
+        if (k_block + 1 < K_blocks) {{
+            next_vec0 = w_block[0];
+            next_vec1 = w_block[1];
+            w_block += w_stride;
+        }}
+
+        half scale = as_type<half>((uint16_t)(cur_vec0.x & 0xFFFF));
+
+        struct PackedBlock {{ uint4 v0, v1; }};
+        PackedBlock blk = {{cur_vec0, cur_vec1}};
+        thread const uchar* blk_bytes = (thread const uchar*)&blk;
+    """
+
+    if group_size == 128:
+        source += f"""
+        half block_acc0 = 0, block_acc1 = 0, block_acc2 = 0, block_acc3 = 0;
+        device const half4* act_vec = (device const half4*)act_block;
+
+        #pragma unroll(6)
+        for (uint c = 0; c < 6; c++) {{
+            half4 x0 = act_vec[c * 5 + 0];
+            half4 x1 = act_vec[c * 5 + 1];
+            half4 x2 = act_vec[c * 5 + 2];
+            half4 x3 = act_vec[c * 5 + 3];
+            half4 x4 = act_vec[c * 5 + 4];
+
+            uint8_t b0 = blk_bytes[2 + c * 4 + 0];
+            uint8_t b1 = blk_bytes[2 + c * 4 + 1];
+            uint8_t b2 = blk_bytes[2 + c * 4 + 2];
+            uint8_t b3 = blk_bytes[2 + c * 4 + 3];
+
+            half4 w0_low = base3_lut_low[b0]; half w0_high = base3_lut_high[b0];
+            half4 w1_low = base3_lut_low[b1]; half w1_high = base3_lut_high[b1];
+            half4 w2_low = base3_lut_low[b2]; half w2_high = base3_lut_high[b2];
+            half4 w3_low = base3_lut_low[b3]; half w3_high = base3_lut_high[b3];
+
+            block_acc0 += dot(x0, w0_low) + x1.x * w0_high;
+            block_acc1 += dot(x1.yzw, w1_low.xyz) + x2.x * w1_low.w + x2.y * w1_high;
+            block_acc2 += dot(x2.zw, w2_low.xy) + dot(x3.xyz, half3(w2_low.z, w2_low.w, w2_high));
+            block_acc3 += x3.w * w3_low.x + dot(x4, half4(w3_low.y, w3_low.z, w3_low.w, w3_high));
+        }}
+
+        device const half4* tail_vec = (device const half4*)(act_block + 120);
+        half4 tail0 = tail_vec[0];
+        half4 tail1 = tail_vec[1];
+
+        uint8_t b24 = blk_bytes[2 + 24];
+        uint8_t b25 = blk_bytes[2 + 25];
+
+        half4 w24_low = base3_lut_low[b24];
+        half w24_high = base3_lut_high[b24];
+        half4 w25_low = base3_lut_low[b25];
+
+        block_acc0 += dot(tail0, w24_low) + tail1.x * w24_high;
+        block_acc1 += dot(tail1.yzw, w25_low.xyz);
+
+        half block_acc = (block_acc0 + block_acc1) + (block_acc2 + block_acc3);
+        acc += block_acc * scale;
+        act_block += 128;
+        cur_vec0 = next_vec0;
+        cur_vec1 = next_vec1;
+        """
+    else:
+        source += f"""
+        half block_acc = 0;
+
+        #pragma unroll(30)
+        for (uint i = 0; i < 30; i++) {{
+            uint8_t b = blk_bytes[2 + i];
+            half4 w_low = base3_lut_low[b];
+            half w_high = base3_lut_high[b];
+            uint curr_x = i * 5;
+            half4 x_low = half4(act_block[curr_x], act_block[curr_x + 1], act_block[curr_x + 2], act_block[curr_x + 3]);
+            half x_high = act_block[curr_x + 4];
+            block_acc += dot(x_low, w_low) + x_high * w_high;
+        }}
+        acc += block_acc * scale;
+        act_block += 150;
+        cur_vec0 = next_vec0;
+        cur_vec1 = next_vec1;
+        """
+
+    source += f"""
+    }}
+
+    output[row * {N} + col] = acc;
+    """
+    return source
+
+
 def get_gemm_source(M, K, N, G_SIZE):
     num_bytes = 26 if G_SIZE == 128 else 30
     k_tile = 128 if G_SIZE == 128 else 152
@@ -987,6 +1284,131 @@ def ternary_swiglu(
     grid_x = ((N + tg_x - 1) // tg_x) * tg_x
     out = _KERNEL_CACHE[shape_key](
         inputs=[x_flat, w_gate_packed, w_up_packed],
+        grid=(grid_x, M, 1),
+        threadgroup=(tg_x, 1, 1),
+        output_shapes=[(M, N)],
+        output_dtypes=[mx.float16]
+    )
+    res = out[0]
+
+    if len(orig_shape) > 2:
+        return res.reshape(*orig_shape[:-1], N)
+    elif len(orig_shape) == 1:
+        return res.reshape(N)
+    return res
+
+
+def ternary_fused_kv(
+    x: mx.array,
+    w_k_packed: mx.array,
+    w_v_packed: mx.array,
+    group_size: int = None
+) -> tuple[mx.array, mx.array]:
+    """
+    Fused Key and Value projections: x @ w_k and x @ w_v.
+
+    Reuses loaded activation vector chunks in registers across dual-issue ALU pipelines,
+    evaluating both projections concurrently in a single kernel dispatch.
+
+    Args:
+        x: Input activations of shape (..., K).
+        w_k_packed: Key projection packed weights of shape (K_blocks, N, 32).
+        w_v_packed: Value projection packed weights of shape (K_blocks, N, 32).
+        group_size: Scale group size (128 or 150). Inferred if None.
+
+    Returns:
+        tuple[mx.array, mx.array]: (out_k, out_v) activations each of shape (..., N).
+    """
+    orig_shape = x.shape
+    x_flat = x.reshape(-1, orig_shape[-1])
+    if x_flat.dtype != mx.float16:
+        x_flat = x_flat.astype(mx.float16)
+
+    M = x_flat.shape[0]
+    K = x_flat.shape[1]
+    N = w_k_packed.shape[1]
+    K_blocks = w_k_packed.shape[0]
+
+    if group_size is None:
+        group_size = K // K_blocks
+
+    shape_key = ("fused_kv", M, K, N, group_size)
+    if shape_key not in _KERNEL_CACHE:
+        source = get_fused_kv_source(M, K, N, group_size)
+        kernel = fast.metal_kernel(
+            name=f"ternary_fused_kv_{M}_{K}_{N}_{group_size}",
+            input_names=["activations", "k_weights", "v_weights"],
+            output_names=["out_k", "out_v"],
+            source=source,
+            header=_LUT_HEADER
+        )
+        _KERNEL_CACHE[shape_key] = kernel
+
+    tg_x = 128
+    grid_x = ((N + tg_x - 1) // tg_x) * tg_x
+    out_k, out_v = _KERNEL_CACHE[shape_key](
+        inputs=[x_flat, w_k_packed, w_v_packed],
+        grid=(grid_x, M, 1),
+        threadgroup=(tg_x, 1, 1),
+        output_shapes=[(M, N), (M, N)],
+        output_dtypes=[mx.float16, mx.float16]
+    )
+
+    if len(orig_shape) > 2:
+        return out_k.reshape(*orig_shape[:-1], N), out_v.reshape(*orig_shape[:-1], N)
+    elif len(orig_shape) == 1:
+        return out_k.reshape(N), out_v.reshape(N)
+    return out_k, out_v
+
+
+def ternary_fused_qkv(
+    x: mx.array,
+    w_qkv_packed: mx.array,
+    group_size: int = None
+) -> mx.array:
+    """
+    Unified Query, Key, and Value projection: x @ w_qkv.
+
+    Executes a single 0-barrier wide GEMV dispatch over concatenated [Q, K, V]
+    interleaved weights, maximizing GPU occupancy and memory reuse.
+
+    Args:
+        x: Input activations of shape (..., K).
+        w_qkv_packed: Concatenated QKV packed weights of shape (K_blocks, N_qkv, 32).
+        group_size: Scale group size (128 or 150). Inferred if None.
+
+    Returns:
+        mx.array: Contiguous output tensor of shape (..., N_qkv).
+    """
+    orig_shape = x.shape
+    x_flat = x.reshape(-1, orig_shape[-1])
+    if x_flat.dtype != mx.float16:
+        x_flat = x_flat.astype(mx.float16)
+
+    M = x_flat.shape[0]
+    K = x_flat.shape[1]
+    N = w_qkv_packed.shape[1]
+    K_blocks = w_qkv_packed.shape[0]
+
+    if group_size is None:
+        group_size = K // K_blocks
+
+    shape_key = ("fused_qkv", M, K, N, group_size)
+    if shape_key not in _KERNEL_CACHE:
+        source = get_fused_qkv_source(M, K, N, group_size)
+        kernel = fast.metal_kernel(
+            name=f"ternary_fused_qkv_{M}_{K}_{N}_{group_size}",
+            input_names=["activations", "interleaved_weights"],
+            output_names=["output"],
+            source=source,
+            header=_LUT_HEADER
+        )
+        _KERNEL_CACHE[shape_key] = kernel
+
+    tg_x = 64
+    grid_x = ((N + tg_x - 1) // tg_x) * tg_x
+    out = _KERNEL_CACHE[shape_key](
+        inputs=[x_flat, w_qkv_packed],
         grid=(grid_x, M, 1),
         threadgroup=(tg_x, 1, 1),
         output_shapes=[(M, N)],
