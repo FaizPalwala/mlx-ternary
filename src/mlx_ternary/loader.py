@@ -91,10 +91,81 @@ def auto_fuse_model_layers(model: Any) -> int:
                     self.qkv = qkv_mod
                     self.orig = orig_attn
 
-                def __call__(self, x, mask=None, cache=None):
-                    # Uses qkv fused dispatch
-                    queries, keys, values = self.qkv(x)
-                    return self.orig._forward_with_qkv(x, queries, keys, values, mask=mask, cache=cache) if hasattr(self.orig, "_forward_with_qkv") else self.orig(x, mask=mask, cache=cache)
+                def __call__(
+                    self,
+                    x: mx.array,
+                    mask: Optional[mx.array] = None,
+                    cache: Optional[Any] = None,
+                ) -> mx.array:
+                    is_2d = x.ndim == 2
+                    if is_2d:
+                        x = x[:, None, :]
+                    B, L, D = x.shape
+
+                    # 1. Single-pass fused QKV dispatch (1 FWHT pass)
+                    q_proj_out, keys, values = self.qkv(x)
+
+                    # Fallback for mock/non-standard attention modules
+                    if not hasattr(self.orig, "q_norm") or not hasattr(self.orig, "o_proj"):
+                        if hasattr(self.orig, "_forward_with_qkv"):
+                            out = self.orig._forward_with_qkv(x, q_proj_out, keys, values, mask=mask, cache=cache)
+                        else:
+                            out = self.orig(x, mask=mask, cache=cache)
+                        return out.squeeze(1) if is_2d else out
+
+                    # 2. Handle Qwen output gating (split queries and gate if head dimension is doubled)
+                    if hasattr(self.orig, "num_attention_heads") and hasattr(self.orig, "head_dim"):
+                        expected_q_dim = self.orig.num_attention_heads * self.orig.head_dim * 2
+                        if q_proj_out.shape[-1] == expected_q_dim:
+                            queries, gate = mx.split(
+                                q_proj_out.reshape(B, L, self.orig.num_attention_heads, -1), 2, axis=-1
+                            )
+                            gate = gate.reshape(B, L, -1)
+                        else:
+                            queries = q_proj_out.reshape(B, L, self.orig.num_attention_heads, -1)
+                            gate = None
+                    else:
+                        queries = q_proj_out
+                        gate = None
+
+                    # 3. Apply RMSNorms and transposes
+                    queries = self.orig.q_norm(queries).transpose(0, 2, 1, 3)
+                    keys = self.orig.k_norm(keys.reshape(B, L, self.orig.num_key_value_heads, -1)).transpose(0, 2, 1, 3)
+                    values = values.reshape(B, L, self.orig.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+
+                    # 4. RoPE & KV Cache updates
+                    if cache is not None:
+                        queries = self.orig.rope(queries, offset=cache.offset)
+                        keys = self.orig.rope(keys, offset=cache.offset)
+                        keys, values = cache.update_and_fetch(keys, values)
+                    else:
+                        queries = self.orig.rope(queries)
+                        keys = self.orig.rope(keys)
+
+                    # 5. Scaled Dot-Product Attention
+                    try:
+                        output = mx.fast.scaled_dot_product_attention(
+                            queries, keys, values, cache=cache, scale=self.orig.scale, mask=mask
+                        )
+                    except TypeError:
+                        try:
+                            from mlx_lm.models.base import scaled_dot_product_attention
+                            output = scaled_dot_product_attention(
+                                queries, keys, values, cache=cache, scale=self.orig.scale, mask=mask
+                            )
+                        except Exception:
+                            output = mx.fast.scaled_dot_product_attention(
+                                queries, keys, values, scale=self.orig.scale, mask=mask
+                            )
+
+                    output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+
+                    # 6. Apply attention output gate (if present) and project out
+                    if gate is not None:
+                        output = output * mx.sigmoid(gate)
+
+                    out = self.orig.o_proj(output)
+                    return out.squeeze(1) if is_2d else out
 
             layer.self_attn = FusedAttentionWrapper(qkv, orig_self_attn)
             fused_count += 1
