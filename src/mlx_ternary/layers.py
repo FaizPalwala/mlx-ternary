@@ -1,41 +1,33 @@
+import math
+from typing import Optional
+
 import mlx.core as mx
 import mlx.nn as nn
 from .ops import ternary_matmul, ternary_swiglu, ternary_fused_kv, ternary_fused_qkv
 
-def fwht(x, block, signs=None, inverse=False):
+
+def fwht(x: mx.array, block: int, signs: Optional[mx.array] = None, inverse: bool = False) -> mx.array:
     """
-    Fast Walsh-Hadamard Transform implementation for Bonsai.
+    Normalized Sylvester-Walsh-Hadamard Transform on Apple Silicon.
+    Scales by 1/sqrt(block) using native mx.hadamard_transform.
     """
     if block <= 0:
         return x
-    
-    # We fallback to standard MLX ops here, or a custom Metal kernel in the future
-    # A standard FWHT multiplies activations against a Walsh-Hadamard matrix
-    # This is a placeholder for the actual FWHT algorithm for PrismML
-    import math
-    if signs is not None:
-        if inverse:
-            x = x * signs
-    
-    # Simple unoptimized FWHT for demonstration
-    # (In production, this needs a custom Metal kernel or iterative butterfly network)
-    n = block
-    h = 1
-    while h < n:
-        for i in range(0, n, h * 2):
-            for j in range(i, i + h):
-                x_j = x[..., j]
-                x_jh = x[..., j + h]
-                x[..., j] = x_j + x_jh
-                x[..., j + h] = x_j - x_jh
-        h *= 2
-        
-    x = x / math.sqrt(n)
-    
+
+    shape, dtype = x.shape, x.dtype
+    if shape[-1] % block != 0:
+        raise ValueError(f"Hadamard block {block} does not divide activation width {shape[-1]}")
+
+    x_f32 = x.astype(mx.float32)
     if signs is not None and not inverse:
-        x = x * signs
-        
-    return x
+        x_f32 = x_f32 * signs
+
+    x_rot = mx.hadamard_transform(x_f32.reshape(-1, block), scale=1.0 / math.sqrt(block)).reshape(shape)
+
+    if signs is not None and inverse:
+        x_rot = x_rot * signs
+
+    return x_rot.astype(dtype)
 
 from .quantize import pack_interleaved
 
@@ -51,12 +43,16 @@ class TernaryLinear(nn.Module):
         output_dims: int = None,
         bias: bool = False,
         group_size: int = 128,
-        pad_k: int = 0
+        pad_k: int = 0,
+        block: int = 0,
+        signs: Optional[mx.array] = None,
     ):
         super().__init__()
         self.group_size = group_size
         self.pad_k = pad_k
         self.bias = None
+        self.block = block
+        self.signs = signs
 
         if isinstance(input_dims_or_weight, mx.array):
             self.weight_packed = input_dims_or_weight
@@ -82,7 +78,32 @@ class TernaryLinear(nn.Module):
                 w_raw = w_raw.T
         self.weight_packed, self.pad_k = pack_interleaved(w_raw, group_size=self.group_size)
 
+    @classmethod
+    def from_raw(
+        cls,
+        w_raw: mx.array,
+        bias: bool = False,
+        group_size: int = 128,
+        block: int = 0,
+        signs: Optional[mx.array] = None,
+    ) -> "TernaryLinear":
+        """
+        Construct TernaryLinear directly from unquantized FP16 weights.
+        Accepts weights shaped as (K, N) or PyTorch standard (N, K).
+        """
+        if w_raw.ndim != 2:
+            raise ValueError(f"Expected 2D weight tensor, got shape {w_raw.shape}")
+        w_packed, pad_k = pack_interleaved(w_raw, group_size=group_size)
+        layer = cls(w_packed, bias=bias, group_size=group_size, pad_k=pad_k, block=block, signs=signs)
+        layer.input_dims = w_raw.shape[0]
+        layer.output_dims = w_raw.shape[1]
+        return layer
+
     def __call__(self, x: mx.array) -> mx.array:
+        if self.block > 0 and self.signs is not None:
+            x = fwht(x, self.block, self.signs)
+        elif self.block > 0:
+            x = fwht(x, self.block)
         if self.pad_k > 0:
             *batch, k = x.shape
             x = mx.concatenate([x, mx.zeros((*batch, self.pad_k), dtype=x.dtype)], axis=-1)
@@ -103,15 +124,19 @@ class BonsaiTernaryLinear(TernaryLinear):
         group_size: int = 128,
         pad_k: int = 0,
         block: int = 0,
-        signs: mx.array = None
+        signs: Optional[mx.array] = None,
     ):
-        super().__init__(weight_packed, output_dims=output_dims, bias=bias, group_size=group_size, pad_k=pad_k)
-        self.block = block
-        self.signs = signs
+        super().__init__(
+            weight_packed,
+            output_dims=output_dims,
+            bias=bias,
+            group_size=group_size,
+            pad_k=pad_k,
+            block=block,
+            signs=signs,
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
-        if self.block:
-            x = fwht(x, self.block, self.signs)
         return super().__call__(x)
 
 
@@ -128,11 +153,15 @@ class TernarySwiGLU(nn.Module):
         output_dims_or_up=None,
         output_dims: int = None,
         group_size: int = 128,
-        pad_k: int = 0
+        pad_k: int = 0,
+        block: int = 0,
+        signs: Optional[mx.array] = None,
     ):
         super().__init__()
         self.group_size = group_size
         self.pad_k = pad_k
+        self.block = block
+        self.signs = signs
 
         if isinstance(input_dims_or_gate, mx.array) and isinstance(output_dims_or_up, mx.array):
             self.gate_packed = input_dims_or_gate
@@ -161,7 +190,41 @@ class TernarySwiGLU(nn.Module):
         self.gate_packed, self.pad_k = pack_interleaved(w_gate_raw, group_size=self.group_size)
         self.up_packed, _ = pack_interleaved(w_up_raw, group_size=self.group_size)
 
+    @classmethod
+    def from_raw(
+        cls,
+        w_gate: mx.array,
+        w_up: mx.array,
+        group_size: int = 128,
+        block: int = 0,
+        signs: Optional[mx.array] = None,
+    ) -> "TernarySwiGLU":
+        """
+        Construct TernarySwiGLU directly from unquantized FP16 weights.
+        Accepts weights shaped as (K, N) or PyTorch standard (N, K).
+        """
+        if w_gate.ndim == 2 and w_up.ndim == 2:
+            if w_gate.shape[0] == w_up.shape[0]:
+                pass
+            elif w_gate.shape[1] == w_up.shape[1]:
+                w_gate = w_gate.T
+                w_up = w_up.T
+            else:
+                raise ValueError(
+                    f"Incompatible weight shapes for SwiGLU: w_gate={w_gate.shape}, w_up={w_up.shape}"
+                )
+        gate_packed, pad_k = pack_interleaved(w_gate, group_size=group_size)
+        up_packed, _ = pack_interleaved(w_up, group_size=group_size)
+        layer = cls(gate_packed, up_packed, group_size=group_size, pad_k=pad_k, block=block, signs=signs)
+        layer.input_dims = w_gate.shape[0]
+        layer.output_dims = w_gate.shape[1]
+        return layer
+
     def __call__(self, x: mx.array) -> mx.array:
+        if self.block > 0 and self.signs is not None:
+            x = fwht(x, self.block, self.signs)
+        elif self.block > 0:
+            x = fwht(x, self.block)
         if self.pad_k > 0:
             *batch, k = x.shape
             x = mx.concatenate([x, mx.zeros((*batch, self.pad_k), dtype=x.dtype)], axis=-1)
@@ -181,11 +244,15 @@ class TernaryFusedKV(nn.Module):
         kv_dims_or_v=None,
         kv_dims: int = None,
         group_size: int = 128,
-        pad_k: int = 0
+        pad_k: int = 0,
+        block: int = 0,
+        signs: Optional[mx.array] = None,
     ):
         super().__init__()
         self.group_size = group_size
         self.pad_k = pad_k
+        self.block = block
+        self.signs = signs
 
         if isinstance(input_dims_or_k, mx.array) and isinstance(kv_dims_or_v, mx.array):
             self.k_packed = input_dims_or_k
@@ -202,7 +269,14 @@ class TernaryFusedKV(nn.Module):
             self.v_packed = mx.zeros((blocks, self.kv_dims, 32), dtype=mx.uint8)
 
     @classmethod
-    def from_raw(cls, w_k: mx.array, w_v: mx.array, group_size: int = 128) -> "TernaryFusedKV":
+    def from_raw(
+        cls,
+        w_k: mx.array,
+        w_v: mx.array,
+        group_size: int = 128,
+        block: int = 0,
+        signs: Optional[mx.array] = None,
+    ) -> "TernaryFusedKV":
         """
         Construct TernaryFusedKV directly from unquantized FP16 weights.
         Accepts weights shaped as (K, N) or PyTorch standard (N, K).
@@ -219,7 +293,7 @@ class TernaryFusedKV(nn.Module):
                 )
         k_packed, pad_k = pack_interleaved(w_k, group_size=group_size)
         v_packed, _ = pack_interleaved(w_v, group_size=group_size)
-        layer = cls(k_packed, v_packed, group_size=group_size, pad_k=pad_k)
+        layer = cls(k_packed, v_packed, group_size=group_size, pad_k=pad_k, block=block, signs=signs)
         layer.input_dims = w_k.shape[0]
         layer.kv_dims = w_k.shape[1]
         return layer
@@ -237,6 +311,10 @@ class TernaryFusedKV(nn.Module):
         self.v_packed, _ = pack_interleaved(w_v_raw, group_size=self.group_size)
 
     def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        if self.block > 0 and self.signs is not None:
+            x = fwht(x, self.block, self.signs)
+        elif self.block > 0:
+            x = fwht(x, self.block)
         if self.pad_k > 0:
             *batch, k = x.shape
             x = mx.concatenate([x, mx.zeros((*batch, self.pad_k), dtype=x.dtype)], axis=-1)
@@ -258,7 +336,9 @@ class TernaryQKV(nn.Module):
         v_dim: int = None,
         split: bool = True,
         group_size: int = 128,
-        pad_k: int = 0
+        pad_k: int = 0,
+        block: int = 0,
+        signs: Optional[mx.array] = None,
     ):
         super().__init__()
         self.group_size = group_size
@@ -267,6 +347,8 @@ class TernaryQKV(nn.Module):
         self.q_dim = q_dim
         self.k_dim = k_dim
         self.v_dim = v_dim
+        self.block = block
+        self.signs = signs
 
         if isinstance(input_dims_or_qkv, mx.array):
             self.qkv_packed = input_dims_or_qkv
@@ -289,7 +371,9 @@ class TernaryQKV(nn.Module):
         w_k: mx.array,
         w_v: mx.array,
         split: bool = True,
-        group_size: int = 128
+        group_size: int = 128,
+        block: int = 0,
+        signs: Optional[mx.array] = None,
     ) -> "TernaryQKV":
         """
         Construct TernaryQKV directly from unquantized FP16 weights.
@@ -320,7 +404,9 @@ class TernaryQKV(nn.Module):
             v_dim=v_dim,
             split=split,
             group_size=group_size,
-            pad_k=pad_k
+            pad_k=pad_k,
+            block=block,
+            signs=signs,
         )
         layer.input_dims = w_q.shape[0]
         return layer
@@ -340,6 +426,10 @@ class TernaryQKV(nn.Module):
         self.qkv_packed, self.pad_k = pack_interleaved(w_qkv, group_size=self.group_size)
 
     def __call__(self, x: mx.array):
+        if self.block > 0 and self.signs is not None:
+            x = fwht(x, self.block, self.signs)
+        elif self.block > 0:
+            x = fwht(x, self.block)
         if self.pad_k > 0:
             *batch, k = x.shape
             x = mx.concatenate([x, mx.zeros((*batch, self.pad_k), dtype=x.dtype)], axis=-1)
