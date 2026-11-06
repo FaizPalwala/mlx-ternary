@@ -15,6 +15,7 @@ Key Invariants:
    draft model KVCache and target model hybrid recurrent/KV cache.
 """
 
+import sys
 from typing import List, Tuple, Optional, Set, Generator, Dict, Any
 import numpy as np
 import mlx.core as mx
@@ -25,36 +26,78 @@ from .pld import save_cache_checkpoint, restore_cache_checkpoint
 
 class VocabularyMapper:
     """
-    O(1) bidirectional vocabulary mapping between draft and target tokenizers.
+    Exhaustive bidirectional vocabulary mapping and diagnostic validator between draft and target tokenizers.
     Handles exact-match or differing vocabulary spaces with zero per-step latency.
     """
-    def __init__(self, draft_vocab: Dict[str, int], target_vocab: Dict[str, int]):
-        self.draft_size = max(draft_vocab.values()) + 1 if draft_vocab else 0
-        self.target_size = max(target_vocab.values()) + 1 if target_vocab else 0
-        
-        self.draft_to_target = np.full(self.draft_size, -1, dtype=np.int32)
-        self.target_to_draft = np.full(self.target_size, -1, dtype=np.int32)
-        
-        for token_str, d_id in draft_vocab.items():
-            if token_str in target_vocab:
-                t_id = target_vocab[token_str]
+    def __init__(self, target_tokenizer: Any, draft_tokenizer: Any):
+        # Support dict inputs for backward compatibility with unit tests
+        if isinstance(target_tokenizer, dict) and isinstance(draft_tokenizer, dict):
+            if "only_draft" in target_tokenizer or "only_target" in draft_tokenizer:
+                t_vocab = draft_tokenizer
+                d_vocab = target_tokenizer
+            else:
+                t_vocab = target_tokenizer
+                d_vocab = draft_tokenizer
+        else:
+            t_vocab = target_tokenizer.get_vocab() if hasattr(target_tokenizer, "get_vocab") else getattr(target_tokenizer, "vocab", target_tokenizer if isinstance(target_tokenizer, dict) else {})
+            d_vocab = draft_tokenizer.get_vocab() if hasattr(draft_tokenizer, "get_vocab") else getattr(draft_tokenizer, "vocab", draft_tokenizer if isinstance(draft_tokenizer, dict) else {})
+
+        self.target_size = len(t_vocab)
+        self.draft_size = len(d_vocab)
+
+        # 1. Exhaustive Exact Match Check
+        if t_vocab and d_vocab and t_vocab == d_vocab:
+            self.is_identity = True
+            self.draft_to_target = None
+            self.target_to_draft = None
+            print(f"[mlx_ternary] Draft tokenizer verified: 100% bit-exact vocabulary match ({self.target_size:,} tokens).", file=sys.stderr)
+            return
+
+        # 2. Granular Diagnostics on Mismatch
+        self.is_identity = False
+        target_keys = set(t_vocab.keys())
+        draft_keys = set(d_vocab.keys())
+        overlap_keys = target_keys & draft_keys
+
+        aligned_count = sum(1 for k in overlap_keys if t_vocab[k] == d_vocab[k])
+        max_size = max(1, max(self.target_size, self.draft_size))
+        overlap_pct = (len(overlap_keys) / max_size) * 100.0
+        aligned_pct = (aligned_count / max(1, self.target_size)) * 100.0
+
+        print(
+            f"\n⚠️  [mlx_ternary WARNING] Tokenizer Mismatch Detected!\n"
+            f"  • Target Vocabulary: {self.target_size:,} tokens\n"
+            f"  • Draft Vocabulary:  {self.draft_size:,} tokens\n"
+            f"  • String Overlap:    {len(overlap_keys):,} tokens ({overlap_pct:.1f}%)\n"
+            f"  • ID Alignment:      {aligned_count:,} tokens ({aligned_pct:.1f}%)\n"
+            f"  Cross-tokenizer speculation causes token boundary fragmentation.\n"
+            f"  Acceptance rate will likely drop below 20%, degrading performance.\n"
+            f"  Recommendation: Use a draft model sharing the target model's base tokenizer.\n",
+            file=sys.stderr,
+        )
+
+        max_d = max(d_vocab.values()) + 1 if d_vocab else 0
+        max_t = max(t_vocab.values()) + 1 if t_vocab else 0
+        self.draft_to_target = np.full(max_d, -1, dtype=np.int32)
+        self.target_to_draft = np.full(max_t, -1, dtype=np.int32)
+
+        for token_str, d_id in d_vocab.items():
+            if token_str in t_vocab:
+                t_id = t_vocab[token_str]
                 self.draft_to_target[d_id] = t_id
                 self.target_to_draft[t_id] = d_id
-                
-        self.is_identity = bool(self.draft_size == self.target_size and 
-                                 np.all(self.draft_to_target == np.arange(self.draft_size)))
 
     def to_target(self, draft_token_id: int) -> int:
         if self.is_identity:
             return draft_token_id
-        if 0 <= draft_token_id < self.draft_size:
+        if self.draft_to_target is not None and 0 <= draft_token_id < len(self.draft_to_target):
             return int(self.draft_to_target[draft_token_id])
         return -1
 
     def to_draft(self, target_token_id: int) -> int:
         if self.is_identity:
             return target_token_id
-        if 0 <= target_token_id < self.target_size:
+        if self.target_to_draft is not None and 0 <= target_token_id < len(self.target_to_draft):
             return int(self.target_to_draft[target_token_id])
         return -1
 

@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_ternary.speculative.self_speculative import (
     LayerPrunedDraftModel,
+    EarlyExitAdapter,
     self_speculative_generate,
 )
 from mlx_ternary.speculative.pld import save_cache_checkpoint, restore_cache_checkpoint
@@ -134,3 +135,19 @@ def test_self_speculative_cache_rollback():
 
     assert all(c.offset == 0 for c in target_cache)
     assert all(c.offset == 0 for c in draft_cache)
+
+
+def test_early_exit_adapter():
+    hidden_dim = 16
+    rank = 4
+    adapter = EarlyExitAdapter(hidden_dim=hidden_dim, rank=rank)
+
+    x = mx.random.normal((2, 5, hidden_dim))
+    out = adapter(x)
+    assert out.shape == (2, 5, hidden_dim)
+
+    # Test integration into LayerPrunedDraftModel
+    full_model = MockModel(num_layers=8)
+    draft_model = LayerPrunedDraftModel(full_model, num_layers=4, exit_head=adapter)
+    logits = draft_model(mx.array([[1, 2, 3]], dtype=mx.int32))
+    assert logits.shape == (1, 3, 50)

@@ -135,6 +135,7 @@ def generate_cli(
     num_draft_tokens: int = 4,
     draft_layers: int = None,
     draft_model: str = "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+    exit_head: str = None,
     max_tokens: int = 256,
     verbose: bool = False,
 ):
@@ -167,6 +168,7 @@ def generate_cli(
         num_draft=num_draft_tokens,
         draft_layers=draft_layers,
         draft_model_path=draft_model,
+        exit_head_path=exit_head,
         verbose=verbose,
     ):
         print(chunk, end="", flush=True)
@@ -358,6 +360,12 @@ def main():
         help="Draft model repo ID for cross-model speculative decoding",
     )
     generate_parser.add_argument(
+        "--exit-head",
+        type=str,
+        default=None,
+        help="Path to trained EarlyExitAdapter safetensors weights (RFC-002)",
+    )
+    generate_parser.add_argument(
         "--max-tokens",
         type=int,
         default=256,
@@ -401,6 +409,7 @@ def main():
             num_draft_tokens=args.num_draft_tokens,
             draft_layers=args.draft_layers,
             draft_model=args.draft_model,
+            exit_head=args.exit_head,
             max_tokens=args.max_tokens,
             verbose=args.verbose,
         )

@@ -198,6 +198,7 @@ def generate_speculative(
     num_draft: int = 4,
     draft_layers: Optional[int] = None,
     draft_model_path: Optional[str] = None,
+    exit_head_path: Optional[str] = None,
     verbose: bool = False,
 ) -> Generator[str, None, None]:
     """
@@ -215,12 +216,17 @@ def generate_speculative(
         num_draft: Number of candidate draft tokens to speculate per step (default: 4).
         draft_layers: Number of draft layers for 'self' mode (default: dynamic model-agnostic max(4, total_layers // 4)).
         draft_model_path: Checkpoint identifier for 'qwen' mode.
+        exit_head_path: Checkpoint path to EarlyExitAdapter safetensors for 'self' mode.
         verbose: If True, log telemetry and routing decisions to stderr.
 
     Yields:
         Streaming decoded string chunks (str).
     """
-    selected_mode = select_speculative_mode(prompt, mode=mode)
+    if exit_head_path is not None:
+        selected_mode = "self"
+    else:
+        selected_mode = select_speculative_mode(prompt, mode=mode)
+
     if verbose:
         print(f"[mlx_ternary router] Speculative routing policy: requested='{mode}', active='{selected_mode}'", file=sys.stderr)
 
@@ -262,6 +268,7 @@ def generate_speculative(
             max_tokens=max_tokens,
             num_draft=num_draft,
             num_draft_layers=draft_layers,
+            exit_head_path=exit_head_path,
             stop_tokens=stop_tokens,
         )
     elif selected_mode == "qwen":

@@ -18,22 +18,45 @@ Key Invariants:
 """
 
 from typing import List, Tuple, Optional, Set, Generator, Dict, Any
+from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
 from .pld import save_cache_checkpoint, restore_cache_checkpoint
 
 
+class EarlyExitAdapter(nn.Module):
+    """
+    Ultra-lightweight low-rank adapter (RFC-002) for layer-pruned draft models.
+    Maps intermediate activations (e.g. layer 16) into final layer representation space.
+    5120 -> 1024 -> 5120 consumes ~10.5 MB FP16 memory.
+    """
+    def __init__(self, hidden_dim: int = 5120, rank: int = 1024):
+        super().__init__()
+        self.norm = nn.RMSNorm(hidden_dim)
+        self.down_proj = nn.Linear(hidden_dim, rank, bias=False)
+        self.up_proj = nn.Linear(rank, hidden_dim, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.up_proj(nn.silu(self.down_proj(self.norm(x))))
+
+
 class LayerPrunedDraftModel:
     """
     Sub-graph wrapper executing the first L_draft layers of the target model
-    with intermediate RMSNorm and projection through the target model's lm_head.
+    with optional EarlyExitAdapter, intermediate RMSNorm, and projection through lm_head.
     """
-    def __init__(self, target_model: Any, num_layers: Optional[int] = None):
+    def __init__(
+        self,
+        target_model: Any,
+        num_layers: Optional[int] = None,
+        exit_head: Optional[nn.Module] = None,
+    ):
         self.target_model = target_model
         total_layers = len(target_model.model.layers) if hasattr(target_model, "model") and hasattr(target_model.model, "layers") else len(getattr(target_model, "layers", []))
         self.num_layers = num_layers if num_layers is not None else max(4, total_layers // 4)
         self.layers = target_model.model.layers[:self.num_layers] if hasattr(target_model, "model") else target_model.layers[:self.num_layers]
+        self.exit_head = exit_head
         self.fa_idx = getattr(target_model.model, "fa_idx", -1) if hasattr(target_model, "model") else -1
         self.ssm_idx = getattr(target_model.model, "ssm_idx", -1) if hasattr(target_model, "model") else -1
 
@@ -67,6 +90,9 @@ class LayerPrunedDraftModel:
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask=mask, cache=c)
 
+        if self.exit_head is not None:
+            h = self.exit_head(h)
+
         norm_h = self.target_model.model.norm(h)
         return self.target_model.lm_head(norm_h)
 
@@ -77,6 +103,8 @@ def self_speculative_generate(
     max_tokens: int = 128,
     num_draft: int = 4,
     num_draft_layers: Optional[int] = None,
+    exit_head: Optional[Any] = None,
+    exit_head_path: Optional[str] = None,
     stop_tokens: Optional[Set[int]] = None,
     target_cache: Optional[List[Any]] = None,
     draft_cache: Optional[List[Any]] = None,
@@ -92,6 +120,8 @@ def self_speculative_generate(
         max_tokens: Maximum tokens to generate.
         num_draft: Candidate tokens to speculate per step (K=3..4).
         num_draft_layers: Number of early layers to execute for draft proposals (default: dynamic model-agnostic max(4, total_layers // 4)).
+        exit_head: Optional instantiated EarlyExitAdapter module.
+        exit_head_path: Optional path to .safetensors weights for EarlyExitAdapter.
         stop_tokens: Set of token IDs terminating generation.
         target_cache: Pre-allocated target model cache.
         draft_cache: Pre-allocated draft sub-graph cache.
@@ -107,7 +137,14 @@ def self_speculative_generate(
     if target_cache is None:
         target_cache = model.make_cache()
 
-    draft_model = LayerPrunedDraftModel(model, num_layers=num_draft_layers)
+    if exit_head is None and exit_head_path is not None:
+        p = Path(exit_head_path)
+        if p.exists():
+            hidden_dim = getattr(model.config, "hidden_size", 5120) if hasattr(model, "config") else 5120
+            exit_head = EarlyExitAdapter(hidden_dim=hidden_dim)
+            exit_head.load_weights(str(p))
+
+    draft_model = LayerPrunedDraftModel(model, num_layers=num_draft_layers, exit_head=exit_head)
     if draft_cache is None:
         draft_cache = draft_model.make_cache()
 
