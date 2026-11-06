@@ -113,7 +113,7 @@ def select_speculative_mode(
 
     prompt_lower = prompt.lower()
 
-    # Heuristic 1: Code / structured JSON syntax -> PLD (zero VRAM overhead, 100% acceptance on repeats)
+    # 1. Code / structured JSON syntax -> PLD (zero VRAM overhead, instant n-gram acceleration)
     if (
         any(p in prompt for p in CODE_PATTERNS)
         or any(p in prompt_lower for p in CODE_INSENSITIVE_PATTERNS)
@@ -122,18 +122,12 @@ def select_speculative_mode(
     ):
         return "pld"
 
-    # Heuristic 2: Constrained unified memory (< 24 GB) -> PLD (0 MB extra VRAM)
-    if device_mem_gb is None:
-        device_mem_gb = get_device_memory_gb()
-    if device_mem_gb is not None and device_mem_gb < 24.0:
-        return "pld"
-
-    # Heuristic 3: Multi-step reasoning / math -> Self-speculative layer-pruned draft
+    # 2. Multi-step reasoning / math -> Self-speculative layer-pruned draft
     if any(p in prompt_lower for p in REASONING_PATTERNS):
         return "self"
 
-    # Heuristic 4: Fallback -> Native shape-aware GEMV decode
-    return "none"
+    # 3. General conversational fallback -> PLD (zero extra VRAM, 0 ms penalty if no n-grams match)
+    return "pld"
 
 
 def native_generate(
@@ -201,7 +195,8 @@ def generate_speculative(
     prompt: str,
     mode: str = "auto",
     max_tokens: int = 256,
-    draft_layers: int = 16,
+    num_draft: int = 4,
+    draft_layers: Optional[int] = None,
     draft_model_path: Optional[str] = None,
     verbose: bool = False,
 ) -> Generator[str, None, None]:
@@ -217,7 +212,8 @@ def generate_speculative(
         prompt: Raw text input prompt.
         mode: Speculative mode ('auto', 'pld', 'self', 'qwen', 'none').
         max_tokens: Maximum number of tokens to generate.
-        draft_layers: Number of draft layers for 'self' mode (default: 16).
+        num_draft: Number of candidate draft tokens to speculate per step (default: 4).
+        draft_layers: Number of draft layers for 'self' mode (default: dynamic model-agnostic max(4, total_layers // 4)).
         draft_model_path: Checkpoint identifier for 'qwen' mode.
         verbose: If True, log telemetry and routing decisions to stderr.
 
@@ -256,6 +252,7 @@ def generate_speculative(
             model=model,
             prompt_tokens=prompt_tokens,
             max_tokens=max_tokens,
+            num_draft=num_draft,
             stop_tokens=stop_tokens,
         )
     elif selected_mode == "self":
@@ -263,6 +260,7 @@ def generate_speculative(
             model=model,
             prompt_tokens=prompt_tokens,
             max_tokens=max_tokens,
+            num_draft=num_draft,
             num_draft_layers=draft_layers,
             stop_tokens=stop_tokens,
         )

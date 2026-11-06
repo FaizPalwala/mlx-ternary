@@ -29,12 +29,13 @@ class LayerPrunedDraftModel:
     Sub-graph wrapper executing the first L_draft layers of the target model
     with intermediate RMSNorm and projection through the target model's lm_head.
     """
-    def __init__(self, target_model: Any, num_layers: int = 16):
+    def __init__(self, target_model: Any, num_layers: Optional[int] = None):
         self.target_model = target_model
-        self.num_layers = num_layers
-        self.layers = target_model.model.layers[:num_layers]
-        self.fa_idx = target_model.model.fa_idx
-        self.ssm_idx = target_model.model.ssm_idx
+        total_layers = len(target_model.model.layers) if hasattr(target_model, "model") and hasattr(target_model.model, "layers") else len(getattr(target_model, "layers", []))
+        self.num_layers = num_layers if num_layers is not None else max(4, total_layers // 4)
+        self.layers = target_model.model.layers[:self.num_layers] if hasattr(target_model, "model") else target_model.layers[:self.num_layers]
+        self.fa_idx = getattr(target_model.model, "fa_idx", -1) if hasattr(target_model, "model") else -1
+        self.ssm_idx = getattr(target_model.model, "ssm_idx", -1) if hasattr(target_model, "model") else -1
 
     def make_cache(self) -> List[Any]:
         """Allocate a lightweight cache for only the pruned draft layers."""
@@ -74,8 +75,8 @@ def self_speculative_generate(
     model: Any,
     prompt_tokens: List[int],
     max_tokens: int = 128,
-    num_draft: int = 3,
-    num_draft_layers: int = 16,
+    num_draft: int = 4,
+    num_draft_layers: Optional[int] = None,
     stop_tokens: Optional[Set[int]] = None,
     target_cache: Optional[List[Any]] = None,
     draft_cache: Optional[List[Any]] = None,
@@ -90,7 +91,7 @@ def self_speculative_generate(
         prompt_tokens: Input prompt token IDs.
         max_tokens: Maximum tokens to generate.
         num_draft: Candidate tokens to speculate per step (K=3..4).
-        num_draft_layers: Number of early layers to execute for draft proposals (default 16).
+        num_draft_layers: Number of early layers to execute for draft proposals (default: dynamic model-agnostic max(4, total_layers // 4)).
         stop_tokens: Set of token IDs terminating generation.
         target_cache: Pre-allocated target model cache.
         draft_cache: Pre-allocated draft sub-graph cache.

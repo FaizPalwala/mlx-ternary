@@ -71,6 +71,33 @@ def test_layer_pruned_draft_model_init():
     assert draft_model.ssm_idx == 0
 
 
+def test_layer_pruned_draft_model_default_dynamic():
+    # Model-agnostic dynamic layer depth: max(4, total_layers // 4)
+    # 8-layer model -> max(4, 8 // 4) = 4
+    m8 = MockModel(num_layers=8)
+    d8 = LayerPrunedDraftModel(m8)
+    assert d8.num_layers == 4
+    assert len(d8.layers) == 4
+
+    # 64-layer model (e.g. 27B) -> max(4, 64 // 4) = 16
+    m64 = MockModel(num_layers=64)
+    d64 = LayerPrunedDraftModel(m64)
+    assert d64.num_layers == 16
+    assert len(d64.layers) == 16
+
+    # 32-layer model (e.g. 7B) -> max(4, 32 // 4) = 8
+    m32 = MockModel(num_layers=32)
+    d32 = LayerPrunedDraftModel(m32)
+    assert d32.num_layers == 8
+    assert len(d32.layers) == 8
+
+    # 12-layer model -> max(4, 12 // 4) = 4
+    m12 = MockModel(num_layers=12)
+    d12 = LayerPrunedDraftModel(m12)
+    assert d12.num_layers == 4
+    assert len(d12.layers) == 4
+
+
 def test_layer_pruned_draft_forward():
     full_model = MockModel(num_layers=8)
     draft_model = LayerPrunedDraftModel(full_model, num_layers=4)

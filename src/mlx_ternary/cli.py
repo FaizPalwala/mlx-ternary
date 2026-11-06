@@ -132,7 +132,8 @@ def generate_cli(
     repo_id: str,
     prompt: str,
     speculative: str = "auto",
-    draft_layers: int = 16,
+    num_draft_tokens: int = 4,
+    draft_layers: int = None,
     draft_model: str = "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
     max_tokens: int = 256,
     verbose: bool = False,
@@ -163,6 +164,7 @@ def generate_cli(
         prompt=prompt,
         mode=speculative,
         max_tokens=max_tokens,
+        num_draft=num_draft_tokens,
         draft_layers=draft_layers,
         draft_model_path=draft_model,
         verbose=verbose,
@@ -338,10 +340,16 @@ def main():
         help="Speculative decoding mode (default: auto)",
     )
     generate_parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=4,
+        help="Number of speculative candidate draft tokens to propose per step (default: 4)",
+    )
+    generate_parser.add_argument(
         "--draft-layers",
         type=int,
-        default=16,
-        help="Number of layers for self-speculative draft model (default: 16)",
+        default=None,
+        help="Number of layers for self-speculative draft model (default: dynamic model-agnostic max(4, total_layers // 4))",
     )
     generate_parser.add_argument(
         "--draft-model",
@@ -390,6 +398,7 @@ def main():
             args.repo_id,
             prompt,
             speculative=args.speculative,
+            num_draft_tokens=args.num_draft_tokens,
             draft_layers=args.draft_layers,
             draft_model=args.draft_model,
             max_tokens=args.max_tokens,

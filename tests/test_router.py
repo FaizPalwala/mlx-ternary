@@ -139,7 +139,8 @@ def test_select_speculative_mode_reasoning():
 
 def test_select_speculative_mode_fallback():
     prompt = "Describe the view from the top of Mount Everest on a sunny morning."
-    assert select_speculative_mode(prompt, mode="auto", device_mem_gb=32.0) == "none"
+    # PLD is the default zero-RAM workhorse fallback for general conversational prompts
+    assert select_speculative_mode(prompt, mode="auto", device_mem_gb=32.0) == "pld"
 
 
 def test_get_device_memory_gb():
