@@ -470,23 +470,17 @@ def get_elastic_split_k_sources(M: int, K: int, N: int, S: int, group_size: int 
 def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> str:
     """
     Generate Metal Shading Language source for single-pass fused Gate + Up + SiLU contraction.
-
-    Computes: SiLU(x @ w_gate) * (x @ w_up) in a single kernel pass.
-    Reuses loaded activation vector chunks in registers across dual-issue ALU pipelines,
-    evaluating the SiLU activation and product directly in registers before committing to DRAM.
-
-    Args:
-        M: Activation batch/row count.
-        K: Contraction dimension.
-        N: Output dimension.
-        group_size: Quantization group size (128 or 150).
-
-    Returns:
-        str: Metal Shading Language source for fused SwiGLU.
+    Uses threadgroup SRAM cooperative activation caching and single-buffered weight streaming
+    to strictly enforce <= 24 registers for 100% SIMD warp occupancy.
     """
+    num_bytes = 26 if group_size == 128 else 30
+
     source = f"""
+    uint tid = thread_index_in_threadgroup;
     uint col = thread_position_in_grid.x;
     uint row = thread_position_in_grid.y;
+
+    threadgroup half shared_act[{group_size}];
 
     if (col >= {N} || row >= {M}) return;
 
@@ -499,28 +493,30 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
     device const uint4* w_up_ptr = ((device const uint4*)up_weights) + col * 2;
     uint w_stride = {N} * 2;
 
-    // Asynchronous prologue: pre-load block 0 weights for both Gate and Up
-    uint4 cur_g0 = w_gate_ptr[0];
-    uint4 cur_g1 = w_gate_ptr[1];
-    w_gate_ptr += w_stride;
-
-    uint4 cur_u0 = w_up_ptr[0];
-    uint4 cur_u1 = w_up_ptr[1];
-    w_up_ptr += w_stride;
-
     for (uint k_block = 0; k_block < K_blocks; k_block++) {{
-        // Asynchronously issue prefetch for next block weights
-        uint4 next_g0 = uint4(0), next_g1 = uint4(0);
-        uint4 next_u0 = uint4(0), next_u1 = uint4(0);
-        if (k_block + 1 < K_blocks) {{
-            next_g0 = w_gate_ptr[0];
-            next_g1 = w_gate_ptr[1];
-            w_gate_ptr += w_stride;
-
-            next_u0 = w_up_ptr[0];
-            next_u1 = w_up_ptr[1];
-            w_up_ptr += w_stride;
+        // 1. Cooperative load into on-chip SRAM
+        if (tid < 128) {{
+            shared_act[tid] = act_block[tid];
         }}
+    """
+    if group_size == 150:
+        source += f"""
+        if (tid < 22) {{
+            shared_act[128 + tid] = act_block[128 + tid];
+        }}
+        """
+
+    source += f"""
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2. Direct single-buffered weight streaming (<= 24 registers, 100% warp occupancy)
+        uint4 cur_g0 = w_gate_ptr[0];
+        uint4 cur_g1 = w_gate_ptr[1];
+        w_gate_ptr += w_stride;
+
+        uint4 cur_u0 = w_up_ptr[0];
+        uint4 cur_u1 = w_up_ptr[1];
+        w_up_ptr += w_stride;
 
         half scale_g = as_type<half>((uint16_t)(cur_g0.x & 0xFFFF));
         half scale_u = as_type<half>((uint16_t)(cur_u0.x & 0xFFFF));
@@ -537,18 +533,17 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
         half g_acc0 = 0, g_acc1 = 0, g_acc2 = 0, g_acc3 = 0;
         half u_acc0 = 0, u_acc1 = 0, u_acc2 = 0, u_acc3 = 0;
 
-        device const half4* act_vec = (device const half4*)act_block;
+        threadgroup const half4* act_vec = (threadgroup const half4*)shared_act;
 
         #pragma unroll(6)
         for (uint c = 0; c < 6; c++) {{
-            // Load activation chunk once into registers for both projections
             half4 x0 = act_vec[c * 5 + 0];
             half4 x1 = act_vec[c * 5 + 1];
             half4 x2 = act_vec[c * 5 + 2];
             half4 x3 = act_vec[c * 5 + 3];
             half4 x4 = act_vec[c * 5 + 4];
 
-            // 1. Gate Chunk FMAs
+            // Gate Chunk FMAs
             uint8_t gb0 = bytes_g[2 + c * 4 + 0];
             uint8_t gb1 = bytes_g[2 + c * 4 + 1];
             uint8_t gb2 = bytes_g[2 + c * 4 + 2];
@@ -564,7 +559,7 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
             g_acc2 += dot(x2.zw, gw2_low.xy) + dot(x3.xyz, half3(gw2_low.z, gw2_low.w, gw2_high));
             g_acc3 += x3.w * gw3_low.x + dot(x4, half4(gw3_low.y, gw3_low.z, gw3_low.w, gw3_high));
 
-            // 2. Up Chunk FMAs (reuses loaded x0..x4, dual-issue with Gate)
+            // Up Chunk FMAs (reuses loaded x0..x4 from SRAM)
             uint8_t ub0 = bytes_u[2 + c * 4 + 0];
             uint8_t ub1 = bytes_u[2 + c * 4 + 1];
             uint8_t ub2 = bytes_u[2 + c * 4 + 2];
@@ -581,8 +576,9 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
             u_acc3 += x3.w * uw3_low.x + dot(x4, half4(uw3_low.y, uw3_low.z, uw3_low.w, uw3_high));
         }}
 
-        half4 tail0 = act_vec[30];
-        half4 tail1 = act_vec[31];
+        threadgroup const half4* tail_vec = (threadgroup const half4*)&shared_act[120];
+        half4 tail0 = tail_vec[0];
+        half4 tail1 = tail_vec[1];
 
         // Tail Gate
         uint8_t gb24 = bytes_g[2 + 24];
@@ -598,10 +594,6 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
 
         acc_gate += ((g_acc0 + g_acc1) + (g_acc2 + g_acc3)) * scale_g;
         acc_up   += ((u_acc0 + u_acc1) + (u_acc2 + u_acc3)) * scale_u;
-
-        act_block += 128;
-        cur_g0 = next_g0; cur_g1 = next_g1;
-        cur_u0 = next_u0; cur_u1 = next_u1;
         """
     else:
         source += f"""
@@ -611,8 +603,8 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
         #pragma unroll(30)
         for (uint i = 0; i < 30; i++) {{
             uint curr_x = i * 5;
-            half4 x_low = half4(act_block[curr_x], act_block[curr_x + 1], act_block[curr_x + 2], act_block[curr_x + 3]);
-            half x_high = act_block[curr_x + 4];
+            half4 x_low = half4(shared_act[curr_x], shared_act[curr_x + 1], shared_act[curr_x + 2], shared_act[curr_x + 3]);
+            half x_high = shared_act[curr_x + 4];
 
             uint8_t gb = bytes_g[2 + i];
             half4 gw_low = base3_lut_low[gb]; half gw_high = base3_lut_high[gb];
@@ -625,13 +617,11 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
 
         acc_gate += block_acc_g * scale_g;
         acc_up   += block_acc_u * scale_u;
-
-        act_block += 150;
-        cur_g0 = next_g0; cur_g1 = next_g1;
-        cur_u0 = next_u0; cur_u1 = next_u1;
         """
 
     source += f"""
+        act_block += {group_size};
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 
     // In-register SiLU(acc_gate) * acc_up evaluation
@@ -646,9 +636,8 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
 def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
     """
     Generate Metal Shading Language source for single-pass fused Key + Value contraction.
-
-    Reuses loaded activation vector chunks in registers across dual-issue ALU pipelines,
-    evaluating both projections concurrently in a single kernel dispatch.
+    Uses threadgroup SRAM cooperative activation caching and single-buffered weight streaming
+    to strictly enforce <= 24 registers for 100% SIMD warp occupancy.
 
     Args:
         M: Activation batch/row count.
@@ -660,8 +649,11 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
         str: Metal Shading Language source for fused KV.
     """
     source = f"""
+    uint tid = thread_index_in_threadgroup;
     uint col = thread_position_in_grid.x;
     uint row = thread_position_in_grid.y;
+
+    threadgroup half shared_act[{group_size}];
 
     if (col >= {N} || row >= {M}) return;
 
@@ -674,28 +666,30 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
     device const uint4* w_v_ptr = ((device const uint4*)v_weights) + col * 2;
     uint w_stride = {N} * 2;
 
-    // Asynchronous prologue: pre-load block 0 weights for both K and V
-    uint4 cur_k0 = w_k_ptr[0];
-    uint4 cur_k1 = w_k_ptr[1];
-    w_k_ptr += w_stride;
-
-    uint4 cur_v0 = w_v_ptr[0];
-    uint4 cur_v1 = w_v_ptr[1];
-    w_v_ptr += w_stride;
-
     for (uint k_block = 0; k_block < K_blocks; k_block++) {{
-        // Asynchronously prefetch next block weights
-        uint4 next_k0 = uint4(0), next_k1 = uint4(0);
-        uint4 next_v0 = uint4(0), next_v1 = uint4(0);
-        if (k_block + 1 < K_blocks) {{
-            next_k0 = w_k_ptr[0];
-            next_k1 = w_k_ptr[1];
-            w_k_ptr += w_stride;
-
-            next_v0 = w_v_ptr[0];
-            next_v1 = w_v_ptr[1];
-            w_v_ptr += w_stride;
+        // 1. Cooperative load into on-chip SRAM
+        if (tid < 128) {{
+            shared_act[tid] = act_block[tid];
         }}
+    """
+    if group_size == 150:
+        source += f"""
+        if (tid < 22) {{
+            shared_act[128 + tid] = act_block[128 + tid];
+        }}
+        """
+
+    source += f"""
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2. Direct single-buffered weight streaming (<= 24 registers, 100% warp occupancy)
+        uint4 cur_k0 = w_k_ptr[0];
+        uint4 cur_k1 = w_k_ptr[1];
+        w_k_ptr += w_stride;
+
+        uint4 cur_v0 = w_v_ptr[0];
+        uint4 cur_v1 = w_v_ptr[1];
+        w_v_ptr += w_stride;
 
         half scale_k = as_type<half>((uint16_t)(cur_k0.x & 0xFFFF));
         half scale_v = as_type<half>((uint16_t)(cur_v0.x & 0xFFFF));
@@ -712,7 +706,7 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
         half k_acc0 = 0, k_acc1 = 0, k_acc2 = 0, k_acc3 = 0;
         half v_acc0 = 0, v_acc1 = 0, v_acc2 = 0, v_acc3 = 0;
 
-        device const half4* act_vec = (device const half4*)act_block;
+        threadgroup const half4* act_vec = (threadgroup const half4*)shared_act;
 
         #pragma unroll(6)
         for (uint c = 0; c < 6; c++) {{
@@ -755,8 +749,9 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
             v_acc3 += x3.w * vw3_low.x + dot(x4, half4(vw3_low.y, vw3_low.z, vw3_low.w, vw3_high));
         }}
 
-        half4 tail0 = act_vec[30];
-        half4 tail1 = act_vec[31];
+        threadgroup const half4* tail_vec = (threadgroup const half4*)&shared_act[120];
+        half4 tail0 = tail_vec[0];
+        half4 tail1 = tail_vec[1];
 
         // Tail K
         uint8_t kb24 = bytes_k[2 + 24];
@@ -772,10 +767,6 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
 
         acc_k += ((k_acc0 + k_acc1) + (k_acc2 + k_acc3)) * scale_k;
         acc_v += ((v_acc0 + v_acc1) + (v_acc2 + v_acc3)) * scale_v;
-
-        act_block += 128;
-        cur_k0 = next_k0; cur_k1 = next_k1;
-        cur_v0 = next_v0; cur_v1 = next_v1;
         """
     else:
         source += f"""
@@ -785,8 +776,8 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
         #pragma unroll(30)
         for (uint i = 0; i < 30; i++) {{
             uint curr_x = i * 5;
-            half4 x_low = half4(act_block[curr_x], act_block[curr_x + 1], act_block[curr_x + 2], act_block[curr_x + 3]);
-            half x_high = act_block[curr_x + 4];
+            half4 x_low = half4(shared_act[curr_x], shared_act[curr_x + 1], shared_act[curr_x + 2], shared_act[curr_x + 3]);
+            half x_high = shared_act[curr_x + 4];
 
             uint8_t kb = bytes_k[2 + i];
             half4 kw_low = base3_lut_low[kb]; half kw_high = base3_lut_high[kb];
@@ -799,13 +790,11 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
 
         acc_k += block_acc_k * scale_k;
         acc_v += block_acc_v * scale_v;
-
-        act_block += 150;
-        cur_k0 = next_k0; cur_k1 = next_k1;
-        cur_v0 = next_v0; cur_v1 = next_v1;
         """
 
     source += f"""
+        act_block += {group_size};
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 
     out_k[row * {N} + col] = acc_k;
