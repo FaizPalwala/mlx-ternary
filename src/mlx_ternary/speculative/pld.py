@@ -51,8 +51,24 @@ def find_candidate_tokens(
             if tokens[i : i + ngram_size] == query:
                 # Found matching n-gram; return following tokens as draft candidates
                 draft = tokens[i + ngram_size : i + ngram_size + num_draft]
-                if draft:
-                    return draft
+                if not draft:
+                    continue
+
+                # Anti-repetition check:
+                # 1. Reject if candidate immediately repeats the last token
+                if draft[0] == tokens[-1]:
+                    continue
+
+                # 2. Reject if candidate contains a cycle of length <= 3
+                has_cycle = False
+                for cycle_len in range(1, min(4, len(draft))):
+                    if len(draft) >= 2 * cycle_len and draft[:cycle_len] == draft[cycle_len : 2 * cycle_len]:
+                        has_cycle = True
+                        break
+                if has_cycle:
+                    continue
+
+                return draft
 
     return []
 
@@ -142,17 +158,26 @@ def pld_generate(
         return
 
     # 2. Speculative Decode Generation Loop
+    throttle_draft = False
     while len(generated) < max_tokens:
         budget = max_tokens - len(generated)
         k_draft = min(num_draft, budget)
 
-        # Look up candidate draft tokens from prior context
-        draft_tokens = find_candidate_tokens(
-            all_tokens,
-            max_ngram_size=max_ngram_size,
-            min_ngram_size=min_ngram_size,
-            num_draft=k_draft,
-        )
+        # Anti-repetition / anti-loop guard on consecutive identical tokens
+        if len(all_tokens) >= 3 and all_tokens[-1] == all_tokens[-2] == all_tokens[-3]:
+            throttle_draft = True
+
+        if throttle_draft:
+            draft_tokens = []
+            throttle_draft = False
+        else:
+            # Look up candidate draft tokens from prior context
+            draft_tokens = find_candidate_tokens(
+                all_tokens,
+                max_ngram_size=max_ngram_size,
+                min_ngram_size=min_ngram_size,
+                num_draft=k_draft,
+            )
 
         if not draft_tokens:
             # Fallback path: Standard single-token autoregressive step

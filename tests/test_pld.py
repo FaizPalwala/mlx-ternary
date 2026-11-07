@@ -64,3 +64,16 @@ def test_cache_checkpoint_restore():
     assert kv.offset == 42
     assert arr[0] == "arr0_v1"
     assert arr[1] == "arr1_v1"
+
+
+def test_find_candidate_tokens_anti_repetition():
+    # Candidate immediately repeating trailing token: tokens[-1] == 30, following tokens in match: [30, 40]
+    tokens = [1, 2, 10, 20, 30, 30, 40, 7, 8, 10, 20, 30]
+    draft = find_candidate_tokens(tokens, max_ngram_size=3, min_ngram_size=2, num_draft=2)
+    # Draft should reject [30, 40] because draft[0] == tokens[-1]
+    assert draft == []
+
+    # Candidate with cycle of length <= 3: [10, 20, 10, 20]
+    tokens_cycle = [1, 2, 80, 90, 5, 6, 5, 6, 7, 8, 80, 90]
+    draft_cycle = find_candidate_tokens(tokens_cycle, max_ngram_size=2, min_ngram_size=2, num_draft=4)
+    assert draft_cycle == []

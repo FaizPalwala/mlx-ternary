@@ -1257,6 +1257,18 @@ def ternary_swiglu(
     if group_size is None:
         group_size = K // K_blocks
 
+    if M > 1:
+        # Prefill regime (M > 1): Bifurcate to 2D tiled GEMM / AMX matrix multiplications
+        import mlx.nn as nn
+        gate = ternary_matmul(x_flat, w_gate_packed, group_size=group_size)
+        up = ternary_matmul(x_flat, w_up_packed, group_size=group_size)
+        res = (nn.silu(gate.astype(mx.float32)) * up.astype(mx.float32)).astype(mx.float16)
+        if len(orig_shape) > 2:
+            return res.reshape(*orig_shape[:-1], N)
+        elif len(orig_shape) == 1:
+            return res.reshape(N)
+        return res
+
     shape_key = ("fused_swiglu", M, K, N, group_size)
     if shape_key not in _KERNEL_CACHE:
         source = get_fused_swiglu_source(M, K, N, group_size)
@@ -1321,6 +1333,16 @@ def ternary_fused_kv(
     if group_size is None:
         group_size = K // K_blocks
 
+    if M > 1:
+        # Prefill regime (M > 1): Bifurcate to 2D tiled GEMM / AMX matrix multiplications
+        out_k = ternary_matmul(x_flat, w_k_packed, group_size=group_size)
+        out_v = ternary_matmul(x_flat, w_v_packed, group_size=group_size)
+        if len(orig_shape) > 2:
+            return out_k.reshape(*orig_shape[:-1], N), out_v.reshape(*orig_shape[:-1], N)
+        elif len(orig_shape) == 1:
+            return out_k.reshape(N), out_v.reshape(N)
+        return out_k, out_v
+
     shape_key = ("fused_kv", M, K, N, group_size)
     if shape_key not in _KERNEL_CACHE:
         source = get_fused_kv_source(M, K, N, group_size)
@@ -1381,6 +1403,15 @@ def ternary_fused_qkv(
 
     if group_size is None:
         group_size = K // K_blocks
+
+    if M > 1:
+        # Prefill regime (M > 1): Bifurcate to 2D tiled GEMM / AMX matrix multiplications
+        res = ternary_matmul(x_flat, w_qkv_packed, group_size=group_size)
+        if len(orig_shape) > 2:
+            return res.reshape(*orig_shape[:-1], N)
+        elif len(orig_shape) == 1:
+            return res.reshape(N)
+        return res
 
     shape_key = ("fused_qkv", M, K, N, group_size)
     if shape_key not in _KERNEL_CACHE:
