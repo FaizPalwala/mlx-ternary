@@ -1,5 +1,6 @@
 import mlx.core as mx
 import mlx.core.fast as fast
+import mlx.nn as nn
 
 _KERNEL_CACHE = {}
 _GPU_CORE_COUNT = None
@@ -1196,12 +1197,13 @@ def ternary_matmul(x: mx.array, w_packed: mx.array, group_size: int = None) -> m
     if group_size is None:
         group_size = K // K_blocks
         
-    use_gemm = M > 16
+    use_gemm = M > 1
     
     if use_gemm:
         # Prefill compute-bound regime: JIT dequantize to AMX matrix multiply
         w_fp16 = dequantize_interleaved(w_packed, group_size=group_size)
         res = x_flat @ w_fp16
+        del w_fp16
         if len(orig_shape) > 2:
             return res.reshape(*orig_shape[:-1], N)
         elif len(orig_shape) == 1:
@@ -1359,11 +1361,11 @@ def ternary_swiglu(
 
     if M > 1:
         # Prefill compute-bound regime: JIT dequantize to AMX matrix multiply
-        import mlx.nn as nn
         w_gate_fp16 = dequantize_interleaved(w_gate_packed, group_size=group_size)
         w_up_fp16 = dequantize_interleaved(w_up_packed, group_size=group_size)
         gate = x_flat @ w_gate_fp16
         up = x_flat @ w_up_fp16
+        del w_gate_fp16, w_up_fp16
         res = (nn.silu(gate.astype(mx.float32)) * up.astype(mx.float32)).astype(mx.float16)
         if len(orig_shape) > 2:
             return res.reshape(*orig_shape[:-1], N)
@@ -1441,6 +1443,7 @@ def ternary_fused_kv(
         w_v_fp16 = dequantize_interleaved(w_v_packed, group_size=group_size)
         out_k = x_flat @ w_k_fp16
         out_v = x_flat @ w_v_fp16
+        del w_k_fp16, w_v_fp16
         if len(orig_shape) > 2:
             return out_k.reshape(*orig_shape[:-1], N), out_v.reshape(*orig_shape[:-1], N)
         elif len(orig_shape) == 1:
@@ -1512,6 +1515,7 @@ def ternary_fused_qkv(
         # Prefill compute-bound regime: JIT dequantize to AMX matrix multiply
         w_qkv_fp16 = dequantize_interleaved(w_qkv_packed, group_size=group_size)
         res = x_flat @ w_qkv_fp16
+        del w_qkv_fp16
         if len(orig_shape) > 2:
             return res.reshape(*orig_shape[:-1], N)
         elif len(orig_shape) == 1:
