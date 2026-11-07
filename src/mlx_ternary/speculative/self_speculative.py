@@ -17,12 +17,15 @@ Key Invariants:
    states with exact 0.000000 bit-identical precision upon rejection.
 """
 
+import logging
 from typing import List, Tuple, Optional, Set, Generator, Dict, Any
 from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
 from .pld import save_cache_checkpoint, restore_cache_checkpoint
+
+logger = logging.getLogger(__name__)
 
 
 class EarlyExitAdapter(nn.Module):
@@ -75,9 +78,10 @@ class LayerPrunedDraftModel:
         if cache is not None:
             try:
                 from mlx_lm.models.qwen3_5 import create_attention_mask, create_ssm_mask
-            except Exception:
+            except ImportError:
                 create_attention_mask = None
                 create_ssm_mask = None
+                logger.debug("[mlx_ternary] create_attention_mask/create_ssm_mask not found in mlx_lm.models.qwen3_5; proceeding with unmasked draft forward.")
 
             if self.fa_idx < self.num_layers and cache[self.fa_idx] is not None:
                 if create_attention_mask is not None:
