@@ -218,15 +218,14 @@ def pld_generate(
                     break
             else:
                 # Partial match or total miss (n_accept < K)
-                # Rollback cache to checkpoint before speculative candidates
-                restore_cache_checkpoint(cache, checkpoint)
+                # 1. Zero-recomputation cache trim:
+                # The verification pass already wrote activations into the cache up to [current_token] + draft_tokens[:n_accept].
+                # We restore the cache offset to exactly (checkpoint + 1 + n_accept) with ZERO second forward pass.
+                for c, saved in zip(cache, checkpoint):
+                    if saved is not None and hasattr(c, "offset"):
+                        c.offset = saved + 1 + n_accept
 
-                # Commit only the accepted prefix to the cache: [current_token] + draft_tokens[:n_accept]
-                commit_tokens = [current_token] + draft_tokens[:n_accept]
-                x_commit = mx.array([commit_tokens], dtype=mx.int32)
-                hidden_commit = model.model(x_commit, cache=cache)
-                mx.eval(hidden_commit)
-
+                # 2. Yield verified draft tokens
                 for i in range(n_accept):
                     tok = draft_tokens[i]
                     generated.append(tok)
@@ -235,7 +234,7 @@ def pld_generate(
                     if len(generated) >= max_tokens or tok in stop_tokens:
                         return
 
-                # Target model prediction at the divergence position
+                # 3. Yield the divergence token (already predicted by target model at position n_accept)
                 divergence_token = preds_list[n_accept]
                 current_token = divergence_token
                 generated.append(current_token)
