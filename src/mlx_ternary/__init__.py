@@ -1,4 +1,4 @@
-from .ops import ternary_matmul, ternary_swiglu, ternary_fused_kv, ternary_fused_qkv
+from .ops import ternary_matmul, ternary_swiglu, ternary_fused_kv, ternary_fused_qkv, dequantize_interleaved
 from .layers import TernaryLinear, BonsaiTernaryLinear, TernarySwiGLU, TernaryFusedKV, TernaryQKV, fwht
 from .loader import auto_fuse_model_layers, load_model
 from .quantize import pack_interleaved
@@ -12,6 +12,7 @@ __all__ = [
     "ternary_swiglu",
     "ternary_fused_kv",
     "ternary_fused_qkv",
+    "dequantize_interleaved",
     "TernaryLinear",
     "BonsaiTernaryLinear",
     "TernarySwiGLU",

@@ -34,11 +34,26 @@ def auto_fuse_model_layers(model: Any) -> int:
             # Extract block & signs if present (Hadamard-aware)
             block = getattr(gate, "block", 0)
             signs = getattr(gate, "signs", None)
+            group_size = getattr(gate, "group_size", 128)
+
+            in_features = getattr(gate, "input_dims", None)
+            if in_features is None:
+                if hasattr(gate.weight, "shape"):
+                    in_features = gate.weight.shape[0] * group_size if gate.weight.ndim == 3 else gate.weight.shape[0]
+                else:
+                    in_features = 5120
+
+            out_features = getattr(gate, "output_dims", None)
+            if out_features is None:
+                out_features = gate.weight.shape[1] if hasattr(gate.weight, "shape") else 17408
+
+            pad_k = getattr(gate, "pad_k", 0)
 
             swiglu = TernarySwiGLU(
-                in_features=gate.weight.shape[0] if hasattr(gate.weight, "shape") else 5120,
-                out_features=gate.weight.shape[1] if hasattr(gate.weight, "shape") else 17408,
-                group_size=getattr(gate, "group_size", 128),
+                in_features=in_features,
+                out_features=out_features,
+                group_size=group_size,
+                pad_k=pad_k,
                 block=block,
                 signs=signs,
             )
@@ -65,17 +80,28 @@ def auto_fuse_model_layers(model: Any) -> int:
 
             block = getattr(qp, "block", 0)
             signs = getattr(qp, "signs", None)
+            group_size = getattr(qp, "group_size", 128)
+
+            in_features = getattr(qp, "input_dims", None)
+            if in_features is None:
+                if hasattr(qp.weight, "shape"):
+                    in_features = qp.weight.shape[0] * group_size if qp.weight.ndim == 3 else qp.weight.shape[0]
+                else:
+                    in_features = 5120
+
+            pad_k = getattr(qp, "pad_k", 0)
 
             q_dim = qp.weight.shape[1] if hasattr(qp.weight, "shape") else 3072
             k_dim = kp.weight.shape[1] if hasattr(kp.weight, "shape") else 512
             v_dim = vp.weight.shape[1] if hasattr(vp.weight, "shape") else 512
 
             qkv = TernaryQKV(
-                in_features=qp.weight.shape[0] if hasattr(qp.weight, "shape") else 5120,
+                in_features=in_features,
                 q_dim=q_dim,
                 k_dim=k_dim,
                 v_dim=v_dim,
-                group_size=getattr(qp, "group_size", 128),
+                group_size=group_size,
+                pad_k=pad_k,
                 block=block,
                 signs=signs,
             )

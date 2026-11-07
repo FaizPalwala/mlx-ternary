@@ -1067,6 +1067,121 @@ def get_gemm_source(M, K, N, G_SIZE):
     return source
 
 
+def get_dequantize_interleaved_source(K_blocks: int, N: int, group_size: int = 128) -> str:
+    """
+    Generate Metal Shading Language source for fast JIT dequantization of interleaved base-3 weights.
+
+    Each thread in grid (N, K_blocks) reads one 32-byte chunk (vec0, vec1), extracts the float16 scale,
+    unpacks 128 continuous FP16 weights using LUTs, and performs 100% coalesced global writes.
+    """
+    if group_size == 128:
+        unpack_logic = f"""
+        uint out_idx = 0;
+        #pragma unroll(25)
+        for (uint i = 0; i < 25; i++) {{
+            uint8_t b = blk_bytes[2 + i];
+            half4 w_low = base3_lut_low[b] * scale;
+            half w_high = base3_lut_high[b] * scale;
+            out_ptr[out_idx * {N}] = w_low.x;
+            out_ptr[(out_idx + 1) * {N}] = w_low.y;
+            out_ptr[(out_idx + 2) * {N}] = w_low.z;
+            out_ptr[(out_idx + 3) * {N}] = w_low.w;
+            out_ptr[(out_idx + 4) * {N}] = w_high;
+            out_idx += 5;
+        }}
+        uint8_t b25 = blk_bytes[2 + 25];
+        half4 w25_low = base3_lut_low[b25] * scale;
+        out_ptr[out_idx * {N}] = w25_low.x;
+        out_ptr[(out_idx + 1) * {N}] = w25_low.y;
+        out_ptr[(out_idx + 2) * {N}] = w25_low.z;
+        """
+    else:
+        unpack_logic = f"""
+        uint out_idx = 0;
+        #pragma unroll(30)
+        for (uint i = 0; i < 30; i++) {{
+            uint8_t b = blk_bytes[2 + i];
+            half4 w_low = base3_lut_low[b] * scale;
+            half w_high = base3_lut_high[b] * scale;
+            out_ptr[out_idx * {N}] = w_low.x;
+            out_ptr[(out_idx + 1) * {N}] = w_low.y;
+            out_ptr[(out_idx + 2) * {N}] = w_low.z;
+            out_ptr[(out_idx + 3) * {N}] = w_low.w;
+            out_ptr[(out_idx + 4) * {N}] = w_high;
+            out_idx += 5;
+        }}
+        """
+
+    source = f"""
+    uint col = thread_position_in_grid.x;
+    uint k_block = thread_position_in_grid.y;
+
+    if (col >= {N} || k_block >= {K_blocks}) return;
+
+    device const uint4* w_ptr = (device const uint4*)interleaved_weights;
+    uint block_offset_uint4 = (k_block * {N} + col) * 2;
+    uint4 vec0 = w_ptr[block_offset_uint4];
+    uint4 vec1 = w_ptr[block_offset_uint4 + 1];
+
+    half scale = as_type<half>((uint16_t)(vec0.x & 0xFFFF));
+
+    struct PackedBlock {{
+        uint4 v0;
+        uint4 v1;
+    }};
+    PackedBlock blk = {{vec0, vec1}};
+    thread const uchar* blk_bytes = (thread const uchar*)&blk;
+
+    device half* out_ptr = w_fp16 + (k_block * {group_size}) * {N} + col;
+
+    {unpack_logic}
+    """
+    return source
+
+
+def dequantize_interleaved(w_packed: mx.array, group_size: int = 128) -> mx.array:
+    """
+    Fast JIT dequantization of interleaved base-3 packed weights to full-precision FP16 weights.
+    Feeds Apple Silicon native AMX matrix multiplication during prefill (M > 1).
+
+    Args:
+        w_packed: Packed weights of shape (K_blocks, N, 32) uint8.
+        group_size: Quantization group size (128 or 150).
+
+    Returns:
+        mx.array: Dequantized weights of shape (K, N) float16 where K = K_blocks * group_size.
+    """
+    K_blocks = w_packed.shape[0]
+    N = w_packed.shape[1]
+    K = K_blocks * group_size
+
+    shape_key = ("dequantize_interleaved", K_blocks, N, group_size)
+    if shape_key not in _KERNEL_CACHE:
+        source = get_dequantize_interleaved_source(K_blocks, N, group_size)
+        kernel = fast.metal_kernel(
+            name=f"ternary_dequant_{K_blocks}_{N}_{group_size}",
+            input_names=["interleaved_weights"],
+            output_names=["w_fp16"],
+            source=source,
+            header=_LUT_HEADER
+        )
+        _KERNEL_CACHE[shape_key] = kernel
+
+    tg_x = 32
+    tg_y = 4
+    grid_x = ((N + tg_x - 1) // tg_x) * tg_x
+    grid_y = ((K_blocks + tg_y - 1) // tg_y) * tg_y
+
+    out = _KERNEL_CACHE[shape_key](
+        inputs=[w_packed],
+        grid=(grid_x, grid_y, 1),
+        threadgroup=(tg_x, tg_y, 1),
+        output_shapes=[(K, N)],
+        output_dtypes=[mx.float16]
+    )
+    return out[0]
+
+
 def ternary_matmul(x: mx.array, w_packed: mx.array, group_size: int = None) -> mx.array:
     orig_shape = x.shape
     x_flat = x.reshape(-1, orig_shape[-1])
@@ -1084,29 +1199,14 @@ def ternary_matmul(x: mx.array, w_packed: mx.array, group_size: int = None) -> m
     use_gemm = M > 16
     
     if use_gemm:
-        kernel_type = "gemm"
-        shape_key = (kernel_type, M, K, N, group_size)
-        if shape_key not in _KERNEL_CACHE:
-            source = get_gemm_source(M, K, N, group_size)
-            kernel = fast.metal_kernel(
-                name=f"ternary_{kernel_type}_{M}_{K}_{N}_{group_size}",
-                input_names=["activations", "interleaved_weights"],
-                output_names=["output"],
-                source=source,
-                header=_LUT_HEADER
-            )
-            _KERNEL_CACHE[shape_key] = kernel
-
-        grid_x = ((N + 31) // 32) * 64
-        grid_y = (M + 31) // 32
-        out = _KERNEL_CACHE[shape_key](
-            inputs=[x_flat, w_packed],
-            grid=(grid_x, grid_y, 1),
-            threadgroup=(64, 1, 1),
-            output_shapes=[(M, N)],
-            output_dtypes=[mx.float16]
-        )
-        res = out[0]
+        # Prefill compute-bound regime: JIT dequantize to AMX matrix multiply
+        w_fp16 = dequantize_interleaved(w_packed, group_size=group_size)
+        res = x_flat @ w_fp16
+        if len(orig_shape) > 2:
+            return res.reshape(*orig_shape[:-1], N)
+        elif len(orig_shape) == 1:
+            return res.reshape(N)
+        return res
     else:
         # GEMV regime (M <= 16): Shape-aware hybrid dispatch
         if N <= 1024:
@@ -1258,10 +1358,12 @@ def ternary_swiglu(
         group_size = K // K_blocks
 
     if M > 1:
-        # Prefill regime (M > 1): Bifurcate to 2D tiled GEMM / AMX matrix multiplications
+        # Prefill compute-bound regime: JIT dequantize to AMX matrix multiply
         import mlx.nn as nn
-        gate = ternary_matmul(x_flat, w_gate_packed, group_size=group_size)
-        up = ternary_matmul(x_flat, w_up_packed, group_size=group_size)
+        w_gate_fp16 = dequantize_interleaved(w_gate_packed, group_size=group_size)
+        w_up_fp16 = dequantize_interleaved(w_up_packed, group_size=group_size)
+        gate = x_flat @ w_gate_fp16
+        up = x_flat @ w_up_fp16
         res = (nn.silu(gate.astype(mx.float32)) * up.astype(mx.float32)).astype(mx.float16)
         if len(orig_shape) > 2:
             return res.reshape(*orig_shape[:-1], N)
@@ -1334,9 +1436,11 @@ def ternary_fused_kv(
         group_size = K // K_blocks
 
     if M > 1:
-        # Prefill regime (M > 1): Bifurcate to 2D tiled GEMM / AMX matrix multiplications
-        out_k = ternary_matmul(x_flat, w_k_packed, group_size=group_size)
-        out_v = ternary_matmul(x_flat, w_v_packed, group_size=group_size)
+        # Prefill compute-bound regime: JIT dequantize to AMX matrix multiply
+        w_k_fp16 = dequantize_interleaved(w_k_packed, group_size=group_size)
+        w_v_fp16 = dequantize_interleaved(w_v_packed, group_size=group_size)
+        out_k = x_flat @ w_k_fp16
+        out_v = x_flat @ w_v_fp16
         if len(orig_shape) > 2:
             return out_k.reshape(*orig_shape[:-1], N), out_v.reshape(*orig_shape[:-1], N)
         elif len(orig_shape) == 1:
@@ -1405,8 +1509,9 @@ def ternary_fused_qkv(
         group_size = K // K_blocks
 
     if M > 1:
-        # Prefill regime (M > 1): Bifurcate to 2D tiled GEMM / AMX matrix multiplications
-        res = ternary_matmul(x_flat, w_qkv_packed, group_size=group_size)
+        # Prefill compute-bound regime: JIT dequantize to AMX matrix multiply
+        w_qkv_fp16 = dequantize_interleaved(w_qkv_packed, group_size=group_size)
+        res = x_flat @ w_qkv_fp16
         if len(orig_shape) > 2:
             return res.reshape(*orig_shape[:-1], N)
         elif len(orig_shape) == 1:
