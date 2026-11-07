@@ -93,6 +93,7 @@ def save_cache_checkpoint(cache: List[Any]) -> List[Any]:
 def restore_cache_checkpoint(cache: List[Any], checkpoint: List[Any]) -> None:
     """
     Restore the hybrid cache state to a previous snapshot with bit-identical precision.
+    Handles KVCache (.offset) and GatedDeltaNet ArraysCache (c[0], c[1]).
     """
     for c, saved in zip(cache, checkpoint):
         if saved is None:
@@ -100,7 +101,8 @@ def restore_cache_checkpoint(cache: List[Any], checkpoint: List[Any]) -> None:
         if hasattr(c, "offset"):
             c.offset = saved
         elif hasattr(c, "cache"):
-            c[0], c[1] = saved
+            c[0] = saved[0]
+            c[1] = saved[1]
 
 
 def pld_generate(
@@ -243,14 +245,14 @@ def pld_generate(
                     break
             else:
                 # Partial match or total miss (n_accept < K)
-                # 1. Zero-recomputation cache trim:
-                # The verification pass already wrote activations into the cache up to [current_token] + draft_tokens[:n_accept].
-                # We restore the cache offset to exactly (checkpoint + 1 + n_accept) with ZERO second forward pass.
-                for c, saved in zip(cache, checkpoint):
-                    if saved is not None and hasattr(c, "offset"):
-                        c.offset = saved + 1 + n_accept
+                # 1. Restore hybrid cache to checkpoint prior to draft speculative step
+                restore_cache_checkpoint(cache, checkpoint)
 
-                # 2. Yield verified draft tokens
+                # 2. Advance cache with accepted prefix: [current_token] + draft_tokens[:n_accept]
+                commit_tokens = [current_token] + draft_tokens[:n_accept]
+                _ = model.model(mx.array([commit_tokens], dtype=mx.int32), cache=cache)
+
+                # 3. Yield verified draft tokens
                 for i in range(n_accept):
                     tok = draft_tokens[i]
                     generated.append(tok)
@@ -259,7 +261,7 @@ def pld_generate(
                     if len(generated) >= max_tokens or tok in stop_tokens:
                         return
 
-                # 3. Yield the divergence token (already predicted by target model at position n_accept)
+                # 4. Yield the divergence token (already predicted by target model at position n_accept)
                 divergence_token = preds_list[n_accept]
                 current_token = divergence_token
                 generated.append(current_token)
