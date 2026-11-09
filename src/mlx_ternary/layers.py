@@ -248,9 +248,7 @@ class TernarySwiGLU(nn.Module):
         if self.pad_k > 0:
             *batch, k = x.shape
             x = mx.concatenate([x, mx.zeros((*batch, self.pad_k), dtype=x.dtype)], axis=-1)
-        gate = self.gate_packed if self.gate_packed is not None else getattr(self, "w_gate", None)
-        up = self.up_packed if self.up_packed is not None else getattr(self, "w_up", None)
-        return ternary_swiglu(x, gate, up, group_size=self.group_size)
+        return ternary_swiglu(x, self.gate_packed, self.up_packed, group_size=self.group_size)
 
 
 class TernaryFusedKV(nn.Module):
@@ -470,8 +468,7 @@ class TernaryQKV(nn.Module):
         if self.pad_k > 0:
             *batch, k = x.shape
             x = mx.concatenate([x, mx.zeros((*batch, self.pad_k), dtype=x.dtype)], axis=-1)
-        packed = self.qkv_packed if self.qkv_packed is not None else getattr(self, "w_qkv", None)
-        out = ternary_fused_qkv(x, packed, group_size=self.group_size)
+        out = ternary_fused_qkv(x, self.qkv_packed, group_size=self.group_size)
         if self.split and self.q_dim is not None and self.k_dim is not None:
             q = out[..., :self.q_dim]
             k = out[..., self.q_dim:self.q_dim + self.k_dim]

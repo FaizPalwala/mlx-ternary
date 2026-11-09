@@ -481,7 +481,7 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
     uint col = thread_position_in_grid.x;
     uint row = thread_position_in_grid.y;
 
-    threadgroup half shared_act[{group_size}];
+    threadgroup half shared_act[2][{group_size}];
 
     if (col >= {N} || row >= {M}) return;
 
@@ -495,15 +495,15 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
     uint w_stride = {N} * 2;
 
     for (uint k_block = 0; k_block < K_blocks; k_block++) {{
-        // 1. Cooperative load into on-chip SRAM
+        // 1. Cooperative load into on-chip SRAM (double-buffered)
         if (tid < 128) {{
-            shared_act[tid] = act_block[tid];
+            shared_act[k_block % 2][tid] = act_block[tid];
         }}
     """
     if group_size == 150:
         source += f"""
         if (tid < 22) {{
-            shared_act[128 + tid] = act_block[128 + tid];
+            shared_act[k_block % 2][128 + tid] = act_block[128 + tid];
         }}
         """
 
@@ -534,7 +534,7 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
         half g_acc0 = 0, g_acc1 = 0, g_acc2 = 0, g_acc3 = 0;
         half u_acc0 = 0, u_acc1 = 0, u_acc2 = 0, u_acc3 = 0;
 
-        threadgroup const half4* act_vec = (threadgroup const half4*)shared_act;
+        threadgroup const half4* act_vec = (threadgroup const half4*)shared_act[k_block % 2];
 
         #pragma unroll(6)
         for (uint c = 0; c < 6; c++) {{
@@ -577,7 +577,7 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
             u_acc3 += x3.w * uw3_low.x + dot(x4, half4(uw3_low.y, uw3_low.z, uw3_low.w, uw3_high));
         }}
 
-        threadgroup const half4* tail_vec = (threadgroup const half4*)&shared_act[120];
+        threadgroup const half4* tail_vec = (threadgroup const half4*)&shared_act[k_block % 2][120];
         half4 tail0 = tail_vec[0];
         half4 tail1 = tail_vec[1];
 
@@ -604,8 +604,8 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
         #pragma unroll(30)
         for (uint i = 0; i < 30; i++) {{
             uint curr_x = i * 5;
-            half4 x_low = half4(shared_act[curr_x], shared_act[curr_x + 1], shared_act[curr_x + 2], shared_act[curr_x + 3]);
-            half x_high = shared_act[curr_x + 4];
+            half4 x_low = half4(shared_act[k_block % 2][curr_x], shared_act[k_block % 2][curr_x + 1], shared_act[k_block % 2][curr_x + 2], shared_act[k_block % 2][curr_x + 3]);
+            half x_high = shared_act[k_block % 2][curr_x + 4];
 
             uint8_t gb = bytes_g[2 + i];
             half4 gw_low = base3_lut_low[gb]; half gw_high = base3_lut_high[gb];
@@ -622,7 +622,6 @@ def get_fused_swiglu_source(M: int, K: int, N: int, group_size: int = 128) -> st
 
     source += f"""
         act_block += {group_size};
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 
     // In-register SiLU(acc_gate) * acc_up evaluation
@@ -654,7 +653,7 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
     uint col = thread_position_in_grid.x;
     uint row = thread_position_in_grid.y;
 
-    threadgroup half shared_act[{group_size}];
+    threadgroup half shared_act[2][{group_size}];
 
     if (col >= {N} || row >= {M}) return;
 
@@ -668,15 +667,15 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
     uint w_stride = {N} * 2;
 
     for (uint k_block = 0; k_block < K_blocks; k_block++) {{
-        // 1. Cooperative load into on-chip SRAM
+        // 1. Cooperative load into on-chip SRAM (double-buffered)
         if (tid < 128) {{
-            shared_act[tid] = act_block[tid];
+            shared_act[k_block % 2][tid] = act_block[tid];
         }}
     """
     if group_size == 150:
         source += f"""
         if (tid < 22) {{
-            shared_act[128 + tid] = act_block[128 + tid];
+            shared_act[k_block % 2][128 + tid] = act_block[128 + tid];
         }}
         """
 
@@ -707,7 +706,7 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
         half k_acc0 = 0, k_acc1 = 0, k_acc2 = 0, k_acc3 = 0;
         half v_acc0 = 0, v_acc1 = 0, v_acc2 = 0, v_acc3 = 0;
 
-        threadgroup const half4* act_vec = (threadgroup const half4*)shared_act;
+        threadgroup const half4* act_vec = (threadgroup const half4*)shared_act[k_block % 2];
 
         #pragma unroll(6)
         for (uint c = 0; c < 6; c++) {{
@@ -750,7 +749,7 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
             v_acc3 += x3.w * vw3_low.x + dot(x4, half4(vw3_low.y, vw3_low.z, vw3_low.w, vw3_high));
         }}
 
-        threadgroup const half4* tail_vec = (threadgroup const half4*)&shared_act[120];
+        threadgroup const half4* tail_vec = (threadgroup const half4*)&shared_act[k_block % 2][120];
         half4 tail0 = tail_vec[0];
         half4 tail1 = tail_vec[1];
 
@@ -777,8 +776,8 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
         #pragma unroll(30)
         for (uint i = 0; i < 30; i++) {{
             uint curr_x = i * 5;
-            half4 x_low = half4(shared_act[curr_x], shared_act[curr_x + 1], shared_act[curr_x + 2], shared_act[curr_x + 3]);
-            half x_high = shared_act[curr_x + 4];
+            half4 x_low = half4(shared_act[k_block % 2][curr_x], shared_act[k_block % 2][curr_x + 1], shared_act[k_block % 2][curr_x + 2], shared_act[k_block % 2][curr_x + 3]);
+            half x_high = shared_act[k_block % 2][curr_x + 4];
 
             uint8_t kb = bytes_k[2 + i];
             half4 kw_low = base3_lut_low[kb]; half kw_high = base3_lut_high[kb];
@@ -795,7 +794,6 @@ def get_fused_kv_source(M: int, K: int, N: int, group_size: int = 128) -> str:
 
     source += f"""
         act_block += {group_size};
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 
     out_k[row * {N} + col] = acc_k;

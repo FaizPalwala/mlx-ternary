@@ -57,8 +57,8 @@ def auto_fuse_model_layers(model: Any) -> int:
                 block=block,
                 signs=signs,
             )
-            swiglu.w_gate = gate.weight
-            swiglu.w_up = up.weight
+            swiglu.gate_packed = gate.weight
+            swiglu.up_packed = up.weight
 
             class FusedMLPWrapper(nn.Module):
                 def __init__(self, swiglu_mod, down_proj):
@@ -106,7 +106,7 @@ def auto_fuse_model_layers(model: Any) -> int:
                 signs=signs,
             )
             # Concat weights across output dimension
-            qkv.w_qkv = mx.concatenate([qp.weight, kp.weight, vp.weight], axis=1) if hasattr(qp.weight, "shape") else None
+            qkv.qkv_packed = mx.concatenate([qp.weight, kp.weight, vp.weight], axis=1) if hasattr(qp.weight, "shape") else None
 
             # Wrap attention to use single-pass QKV dispatch
             orig_self_attn = layer.self_attn

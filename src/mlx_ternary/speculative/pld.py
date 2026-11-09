@@ -161,15 +161,29 @@ def pld_generate(
 
     # 2. Speculative Decode Generation Loop
     throttle_draft = False
+    recent_accepts: List[int] = []
+    cooldown_counter = 0
+
     while len(generated) < max_tokens:
         budget = max_tokens - len(generated)
-        k_draft = min(num_draft, budget)
+
+        # Adaptive Throttling: If the last 2 speculative steps yielded 0 accepted tokens,
+        # pause speculation for 8 tokens to avoid the double-forward penalty on novel text.
+        if cooldown_counter > 0:
+            cooldown_counter -= 1
+            k_draft = 0
+        elif len(recent_accepts) >= 2 and recent_accepts[-1] == 0 and recent_accepts[-2] == 0:
+            cooldown_counter = 8
+            k_draft = 0
+            stats["fallback_steps"] += 1
+        else:
+            k_draft = min(num_draft, budget)
 
         # Anti-repetition / anti-loop guard on consecutive identical tokens
         if len(all_tokens) >= 3 and all_tokens[-1] == all_tokens[-2] == all_tokens[-3]:
             throttle_draft = True
 
-        if throttle_draft:
+        if throttle_draft or k_draft <= 0:
             draft_tokens = []
             throttle_draft = False
         else:
@@ -219,6 +233,10 @@ def pld_generate(
                     n_accept += 1
                 else:
                     break
+
+            recent_accepts.append(n_accept)
+            if n_accept > 0:
+                cooldown_counter = 0  # Reset cooldown immediately on successful hit
 
             stats["draft_tokens_accepted"] += n_accept
             if stats["draft_tokens_proposed"] > 0:
