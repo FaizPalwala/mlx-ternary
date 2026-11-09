@@ -5,6 +5,7 @@ Unit tests for Zero-RAM Prompt Lookup Decoding (PLD).
 import pytest
 from mlx_ternary.speculative.pld import (
     find_candidate_tokens,
+    FastNGramIndex,
     save_cache_checkpoint,
     restore_cache_checkpoint,
 )
@@ -77,3 +78,21 @@ def test_find_candidate_tokens_anti_repetition():
     tokens_cycle = [1, 2, 80, 90, 5, 6, 5, 6, 7, 8, 80, 90]
     draft_cycle = find_candidate_tokens(tokens_cycle, max_ngram_size=2, min_ngram_size=2, num_draft=4)
     assert draft_cycle == []
+
+
+def test_fast_ngram_index():
+    tokens = [1, 2, 10, 20, 30, 40, 50, 60, 7, 8, 10, 20, 30]
+    index = FastNGramIndex(tokens, max_ngram_size=3, min_ngram_size=2)
+
+    # 3-gram match: [10, 20, 30] -> [40, 50, 60]
+    cands = index.find_candidates(tokens, num_draft=3)
+    assert cands == [40, 50, 60]
+
+    # Dynamic incremental update
+    tokens.extend([99, 100, 10, 20, 30])
+    for _ in range(5):
+        index.update(tokens)
+
+    # Context ends in [10, 20, 30] again; draft should match most recent continuation [99, 100]
+    cands2 = index.find_candidates(tokens, num_draft=2)
+    assert cands2 == [99, 100]

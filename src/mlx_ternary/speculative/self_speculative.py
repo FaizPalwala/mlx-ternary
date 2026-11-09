@@ -276,16 +276,15 @@ def self_speculative_generate(
             yield curr_token, False, stats
             if curr_token in stop_tokens:
                 break
-        else:
-            # Partial acceptance or total miss (n_accept < K)
+        elif n_accept > 0:
+            # Partial acceptance (0 < n_accept < K)
             # Rollback target cache to checkpoint
             restore_cache_checkpoint(target_cache, target_chk)
 
             # Commit accepted prefix: [curr_token] + draft_cands[:n_accept]
             commit_tokens = [curr_token] + draft_cands[:n_accept]
             x_commit = mx.array([commit_tokens], dtype=mx.int32)
-            hidden_commit = model.model(x_commit, cache=target_cache)
-            mx.eval(hidden_commit)
+            _ = model.model(x_commit, cache=target_cache)
 
             # Rollback draft cache and advance with commit tokens
             restore_cache_checkpoint(draft_cache, draft_chk)
@@ -299,6 +298,29 @@ def self_speculative_generate(
                     return
 
             divergence_tok = int(preds_list[n_accept])
+            curr_token = divergence_tok
+
+            # Advance draft cache with divergence token
+            _ = draft_model(mx.array([[divergence_tok]], dtype=mx.int32), cache=draft_cache)
+
+            generated.append(curr_token)
+            yield curr_token, False, stats
+            if curr_token in stop_tokens:
+                break
+        else:
+            # Total miss (n_accept == 0): Zero re-computation on rejection
+            # Rollback target cache to checkpoint
+            restore_cache_checkpoint(target_cache, target_chk)
+
+            # Advance target cache by feeding ONLY curr_token (no lm_head, zero re-evaluation of draft candidates)
+            x_single = mx.array([[curr_token]], dtype=mx.int32)
+            _ = model.model(x_single, cache=target_cache)
+
+            # Rollback draft cache and advance with single token
+            restore_cache_checkpoint(draft_cache, draft_chk)
+            _ = draft_model(x_single, cache=draft_cache)
+
+            divergence_tok = int(preds_list[0])
             curr_token = divergence_tok
 
             # Advance draft cache with divergence token
