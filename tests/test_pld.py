@@ -96,3 +96,8 @@ def test_fast_ngram_index():
     # Context ends in [10, 20, 30] again; draft should match most recent continuation [99, 100]
     cands2 = index.find_candidates(tokens, num_draft=2)
     assert cands2 == [99, 100]
+
+    # Test min_ngram_size = 3 ignores 2-gram matches
+    tokens_2gram_only = [1, 2, 20, 30, 40, 50, 60, 7, 8, 99, 20, 30]
+    index_3gram = FastNGramIndex(tokens_2gram_only, max_ngram_size=3, min_ngram_size=3)
+    assert index_3gram.find_candidates(tokens_2gram_only, num_draft=2) == []

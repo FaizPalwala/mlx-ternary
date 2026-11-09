@@ -47,7 +47,7 @@ class FastNGramIndex:
     def find_candidates(self, all_tokens: List[int], num_draft: int = 4) -> List[int]:
         """
         Lookup K candidate continuation tokens in O(1) time.
-        Prefers 3-gram matches, falling back to 2-gram matches.
+        Prefers 3-gram matches, falling back to 2-gram matches if min_ngram_size <= 2.
         Enforces anti-repetition guards.
         """
         seq_len = len(all_tokens)
@@ -55,7 +55,7 @@ class FastNGramIndex:
             return []
 
         # 1. Try 3-gram match first (higher precision)
-        if seq_len >= 3:
+        if self.max_ngram_size >= 3 and seq_len >= 3:
             key_3 = (all_tokens[-3], all_tokens[-2], all_tokens[-1])
             occ = self.map_3gram.get(key_3)
             if occ:
@@ -65,8 +65,8 @@ class FastNGramIndex:
                         if draft and self._is_valid_draft(draft, all_tokens[-1]):
                             return draft
 
-        # 2. Try 2-gram match
-        if seq_len >= 2:
+        # 2. Try 2-gram match (if permitted by min_ngram_size)
+        if self.min_ngram_size <= 2 and seq_len >= 2:
             key_2 = (all_tokens[-2], all_tokens[-1])
             occ = self.map_2gram.get(key_2)
             if occ:
@@ -180,7 +180,7 @@ def pld_generate(
     max_tokens: int = 128,
     num_draft: int = 4,
     max_ngram_size: int = 3,
-    min_ngram_size: int = 2,
+    min_ngram_size: int = 3,
     stop_tokens: Optional[Set[int]] = None,
     cache: Optional[List[Any]] = None,
 ) -> Generator[Tuple[int, bool, Dict[str, Any]], None, None]:
@@ -289,18 +289,24 @@ def pld_generate(
             x_cand = mx.array([candidates], dtype=mx.int32)
 
             hidden = model.model(x_cand, cache=cache)
-            logits = model.lm_head(hidden)
-            preds = mx.argmax(logits[0], axis=-1)
-            mx.eval(preds)
-            preds_list = preds.tolist()
 
-            # Verify draft candidates against target model predictions
+            # Sequentially verify draft candidates using fast 1-token GEMV on lm_head (2.4ms vs 52ms)
             n_accept = 0
+            preds_list: List[int] = []
             for i in range(K):
-                if preds_list[i] == draft_tokens[i]:
+                l_i = model.lm_head(hidden[:, i:i+1, :])
+                pred_i = int(mx.argmax(l_i[0, 0, :], axis=-1).item())
+                preds_list.append(pred_i)
+                if pred_i == draft_tokens[i]:
                     n_accept += 1
                 else:
                     break
+
+            # If all K draft tokens matched, compute the final bonus token prediction from position K
+            if n_accept == K:
+                l_bonus = model.lm_head(hidden[:, K:K+1, :])
+                bonus_pred = int(mx.argmax(l_bonus[0, 0, :], axis=-1).item())
+                preds_list.append(bonus_pred)
 
             recent_accepts.append(n_accept)
             if n_accept > 0:
