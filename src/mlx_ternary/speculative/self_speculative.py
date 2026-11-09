@@ -41,7 +41,7 @@ class EarlyExitAdapter(nn.Module):
         self.up_proj = nn.Linear(rank, hidden_dim, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.up_proj(nn.silu(self.down_proj(self.norm(x))))
+        return x + self.up_proj(nn.silu(self.down_proj(self.norm(x))))
 
 
 class LayerPrunedDraftModel:
@@ -67,9 +67,15 @@ class LayerPrunedDraftModel:
         """Allocate a lightweight cache for only the pruned draft layers."""
         return [c for c in self.target_model.make_cache()[:self.num_layers]]
 
-    def __call__(self, x: mx.array, cache: Optional[List[Any]] = None) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        cache: Optional[List[Any]] = None,
+        compute_logits: bool = True,
+    ) -> mx.array:
         """
-        Execute forward pass through the first L_draft layers and project to logits.
+        Execute forward pass through the first L_draft layers.
+        If compute_logits is False, only advances the cache and skips exit_head/norm/lm_head.
         """
         h = self.target_model.model.embed_tokens(x)
         
@@ -93,6 +99,9 @@ class LayerPrunedDraftModel:
         for layer, c in zip(self.layers, cache if cache else [None] * self.num_layers):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask=mask, cache=c)
+
+        if not compute_logits:
+            return h
 
         if self.exit_head is not None:
             h = self.exit_head(h)
@@ -147,6 +156,8 @@ def self_speculative_generate(
             hidden_dim = getattr(model.config, "hidden_size", 5120) if hasattr(model, "config") else 5120
             exit_head = EarlyExitAdapter(hidden_dim=hidden_dim)
             exit_head.load_weights(str(p))
+            logger.info(f"[mlx_ternary] Successfully loaded EarlyExitAdapter from {p}")
+            print(f"[mlx_ternary] Successfully loaded EarlyExitAdapter from {p}")
 
     draft_model = LayerPrunedDraftModel(model, num_layers=num_draft_layers, exit_head=exit_head)
     if draft_cache is None:
@@ -191,9 +202,15 @@ def self_speculative_generate(
             if throttle_cooldown > 0:
                 throttle_cooldown -= 1
                 is_throttled = True
+            elif len(recent_accepts) >= 2 and sum(recent_accepts[-2:]) == 0:
+                is_throttled = True
+                throttle_cooldown = 12  # cooldown 12 steps to prevent penalty on novel text
+                recent_accepts.clear()
+                stats["throttled_steps"] += 1
             elif len(recent_accepts) >= 3 and (sum(recent_accepts) / len(recent_accepts)) < min_acceptance_threshold:
                 is_throttled = True
-                throttle_cooldown = 4  # cooldown 4 steps to avoid rollback penalty
+                throttle_cooldown = 8
+                recent_accepts.clear()
                 stats["throttled_steps"] += 1
 
         if k_draft <= 0 or is_throttled:
@@ -204,7 +221,7 @@ def self_speculative_generate(
             next_tok = int(mx.argmax(logits, axis=-1).item())
 
             # Synchronize draft model
-            _ = draft_model(x, cache=draft_cache)
+            draft_model(x, cache=draft_cache, compute_logits=False)
 
             curr_token = next_tok
             generated.append(curr_token)
@@ -263,6 +280,9 @@ def self_speculative_generate(
         if len(recent_accepts) > 8:
             recent_accepts.pop(0)
 
+        if n_accept > 0:
+            throttle_cooldown = 0
+
         # 5. Commit & Cache Synchronization
         if n_accept == K:
             # 100% acceptance! All K candidates accepted
@@ -275,8 +295,6 @@ def self_speculative_generate(
 
             bonus_tok = int(preds_list[K])
             curr_token = bonus_tok
-            # Advance draft cache with bonus token
-            _ = draft_model(mx.array([[bonus_tok]], dtype=mx.int32), cache=draft_cache)
 
             generated.append(curr_token)
             yield curr_token, False, stats
@@ -294,7 +312,7 @@ def self_speculative_generate(
 
             # Rollback draft cache and advance with commit tokens
             restore_cache_checkpoint(draft_cache, draft_chk)
-            _ = draft_model(x_commit, cache=draft_cache)
+            draft_model(x_commit, cache=draft_cache, compute_logits=False)
 
             for i in range(n_accept):
                 tok = draft_cands[i]
@@ -305,9 +323,6 @@ def self_speculative_generate(
 
             divergence_tok = int(preds_list[n_accept])
             curr_token = divergence_tok
-
-            # Advance draft cache with divergence token
-            _ = draft_model(mx.array([[divergence_tok]], dtype=mx.int32), cache=draft_cache)
 
             generated.append(curr_token)
             yield curr_token, False, stats
@@ -324,13 +339,10 @@ def self_speculative_generate(
 
             # Rollback draft cache and advance with single token
             restore_cache_checkpoint(draft_cache, draft_chk)
-            _ = draft_model(x_single, cache=draft_cache)
+            draft_model(x_single, cache=draft_cache, compute_logits=False)
 
             divergence_tok = int(preds_list[0])
             curr_token = divergence_tok
-
-            # Advance draft cache with divergence token
-            _ = draft_model(mx.array([[divergence_tok]], dtype=mx.int32), cache=draft_cache)
 
             generated.append(curr_token)
             yield curr_token, False, stats
