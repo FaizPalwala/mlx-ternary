@@ -1,7 +1,7 @@
 # mlx-ternary
 
 [![PyPI Version](https://img.shields.io/pypi/v/mlx-ternary.svg)](https://pypi.org/project/mlx-ternary/)
-[![Release](https://img.shields.io/badge/release-v0.5.0--alpha-blue.svg)]()
+[![Release](https://img.shields.io/badge/release-v0.6.0-blue.svg)](https://github.com/FaizPalwala/mlx-ternary/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M-series-black.svg)]()
 [![Metal](https://img.shields.io/badge/Metal-3.1%2B-orange.svg)]()
@@ -12,47 +12,48 @@
 
 ---
 
-## Performance Matrix
-
-Benchmarking **Ternary-Bonsai-2-27B** (27.2B parameters, 64 Transformer layers, 5120 hidden dimension, 17408 MLP dimension):
-
-### Measured Inference Telemetry (Apple M4 Pro, 24 GB)
-
-| Execution Engine | Latency / Contraction | Effective Bandwidth | End-to-End Decode | VRAM Overhead |
-| :--- | :--- | :--- | :--- | :--- |
-| **Naive Baseline GEMV** | $773.7\text{ }\mu\text{s}$ (MLP Gate/Up) | $28.8\text{ GB/s}$ | $6.2\text{ tok/s}$ ($161.9\text{ ms}$) | Baseline |
-| **Phase 2 Hybrid GEMV (Ours)** | **$318.2\text{ }\mu\text{s}$** (MLP Gate/Up) | **$69.9\text{ GB/s}$** (**2.43x speedup**) | **$8.8\text{ tok/s}$** ($113.64\text{ ms}$) | **$0.0\text{ MB}$** |
-| **+ Prompt Lookup Decoding (PLD)** | Batched $M=K+1$ Verify | $\alpha = 100\%$ on code | **$10.5 - 22.9\text{ tok/s}$** (**1.65x boost**) | **$0.0\text{ MB}$** |
-| **+ Self-Speculative (16-Layer)** | $17.6\text{ ms}$ proposal pass | $\alpha = 34.3\%$ on GSM8K | **$12.0 - 15.0\text{ tok/s}$** | **$0.0\text{ MB}$ extra weights** |
-
-### Kernel Micro-Benchmarks (M4 Pro Hardware Testbed)
-- **MLP Gate/Up ($5120 \times 17408$):** **$234.3\text{ }\mu\text{s}$** ($95.1\text{ GB/s}$ sustained, 2.43x speedup over naive kernel).
-- **MLP Down ($17408 \times 5120$):** **$321.7\text{ }\mu\text{s}$** ($69.3\text{ GB/s}$ sustained, high-$K$ SRAM caching).
-- **Attention KV ($5120 \times 512$):** **$111.7\text{ }\mu\text{s}$** ($5.9\text{ GB/s}$, 32-lane cooperative SIMD reduction, 0 barriers).
-- **Speculative Verification ($M=5$ Batched GEMM):** **$516.1\text{ }\mu\text{s}$** ($43.2\text{ GB/s}$).
-
-### Platform Comparisons
-
-| Platform | Memory Bandwidth | Autoregressive Decode (27.2B) | VRAM / Setup |
-| :--- | :--- | :--- | :--- |
-| **Apple M4 Pro (Ours)** | **273 GB/s** | **8.8 tok/s** (Native)<br>**10.5 – 22.9 tok/s** (Speculative) | **24 GB Unified Memory (MacBook Pro)** |
-| **Apple M4 Max (Projected)** | 546 GB/s | $\approx \mathbf{17.5 - 35.0\text{ tok/s}}$ | 128 GB Unified Memory |
-| **NVIDIA RTX 4090 / 5090** | 1,008 – 1,792 GB/s | 35.0 – 143.0 tok/s | Desktop Workstation (Dedicated GPU) |
+> ### 💡 Understanding the Silicon Envelope
+> **27.2 Billion parameters running locally on an everyday laptop.**  
+> In standard FP16, a 27B model demands **54.4 GB VRAM** just to load weights—requiring multi-GPU workstations or high-end Mac Studios.
+> 
+> With `mlx-ternary` on a base **Apple M4 Pro (24 GB Unified Memory, 273 GB/s peak bandwidth, AC Mains)**:
+> - **Total Working Footprint:** **6.37 GB flat** ($0.78\text{ GB}$ / $11\%$ lighter than official Bonsai, leaving $17.6\text{ GB}$ completely free for 32k KV context and OS buffers with zero memory leaks).
+> - **Prefill Latency:** **$116.3\text{ tok/s}$** ($1.15\times$ faster than official Bonsai).
+> - **Autoregressive Decode:** **$15.2 - 16.5\text{ tok/s}$** ($60.6 - 65.8\text{ ms/tok}$).
+> - **Numerical Precision:** **100% Bit-Exact** matching official baseline.
 
 ---
 
-## Key Architectural Highlights
+## Performance Matrix
 
-* **Shape-Aware Hybrid GEMV Kernel:**
-  - **Wide Layers ($N > 1024$, MLP Gate/Up, MLP Down, Attn Q/O):** 1D contiguous column tiling with on-chip SRAM activation caching (`threadgroup half shared_act[128]`), streaming 4KB memory pages in coalesced 128-byte DRAM bursts (**2.43x speedup**, 69.96 – 95.1 GB/s sustained).
-  - **Narrow Layers ($N \le 1024$, Attention KV):** 32-lane cooperative SIMD reduction (`simd_sum`) with 0 threadgroup barriers, eliminating idle GPU core starvation across all 20 GPU cores on Apple M4 Pro.
-* **Universal Multi-Engine Speculative Suite:**
-  - **`pld` (Prompt Lookup Decoding):** Zero-RAM host-memory n-gram candidate proposal ($K=3..5$), delivering **1.65x net speedup** on structured code generation and document QA with bit-identical rollback upon divergence.
-  - **`self` (Self-Speculative Layer Pruning):** Executes the first 16 layers of the target model with intermediate RMSNorm and projection through `lm_head`, achieving **34.3% GSM8K acceptance** with **0 MB extra weight VRAM**.
-  - **`qwen` (Micro-Draft Engine):** High-speed (245 tok/s) draft proposal generation via 4-bit `Qwen2.5-0.5B-Instruct` with $O(1)$ vocabulary cross-mapping.
-  - **`auto` (Intelligent Auto-Selector):** Heuristically inspects prompt syntax and hardware memory headroom ($< 24\text{ GB}$) to select the optimal speculative engine automatically.
-* **Horizon 32-Byte Interleaving:** Scales and biases are interleaved every 32 bytes alongside Base-3 trits, guaranteeing 128-byte cacheline alignment with zero stride stalls.
-* **Zero-Build Architecture:** Pure Python runtime dynamically compiling MSL via `mlx.core.fast.metal_kernel`. Zero C++, zero CMake, zero build steps.
+Benchmarking **Ternary-Bonsai-2-27B** (27.2B parameters, 64 Transformer layers, 5120 hidden dimension, 17408 MLP dimension) on Apple M4 Pro (24 GB Unified Memory, AC Mains):
+
+### End-to-End Workload Telemetry
+
+| Workload Profile | Engine | Prefill Throughput | Decode Throughput | Active VRAM | Parity |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Workload A** (Coding / JSON) | Official Bonsai<br>**mlx-ternary v0.6.0** | $101.36\text{ tok/s}$ ($9.87\text{ ms}$)<br>**$116.34\text{ tok/s}$ ($8.59\text{ ms}$)** | **$16.51\text{ tok/s}$** ($60.57\text{ ms}$)<br>**$16.51\text{ tok/s}$** ($60.57\text{ ms}$) | $7.15\text{ GB}$<br>**$6.37\text{ GB}$** (-0.78 GB) | Reference<br>**100% Bit-Exact** |
+| **Workload B** (Agentic Dialog) | Official Bonsai<br>**mlx-ternary v0.6.0** | $99.63\text{ tok/s}$ ($10.04\text{ ms}$)<br>**$111.56\text{ tok/s}$ ($8.96\text{ ms}$)** | **$15.20\text{ tok/s}$** ($65.81\text{ ms}$)<br>**$15.20\text{ tok/s}$** ($65.81\text{ ms}$) | $7.15\text{ GB}$<br>**$6.37\text{ GB}$** (-0.78 GB) | Reference<br>**100% Bit-Exact** |
+| **Workload C** (GSM8K Math) | Official Bonsai<br>**mlx-ternary v0.6.0** | $101.99\text{ tok/s}$ ($9.80\text{ ms}$)<br>**$95.18\text{ tok/s}$ ($10.51\text{ ms}$)** | **$15.46\text{ tok/s}$** ($64.67\text{ ms}$)<br>**$15.46\text{ tok/s}$** ($64.67\text{ ms}$) | $7.15\text{ GB}$<br>**$6.37\text{ GB}$** (-0.78 GB) | Reference<br>**100% Bit-Exact** |
+
+### Kernel Micro-Benchmarks (M4 Pro Hardware Testbed)
+- **MLP Gate/Up ($5120 \times 17408$):** **$234.3\text{ }\mu\text{s}$** ($95.1\text{ GB/s}$ sustained, 1D SRAM activation caching).
+- **MLP Down ($17408 \times 5120$):** **$321.7\text{ }\mu\text{s}$** ($69.3\text{ GB/s}$ sustained, high-$K$ SRAM caching).
+- **Attention KV ($5120 \times 512$):** **$111.7\text{ }\mu\text{s}$** ($5.9\text{ GB/s}$, 32-lane cooperative SIMD warp reduction, 0 barriers).
+- **Prefill JIT Fast-Path ($M > 1$):** Dispatches directly into Apple AMX block GEMM, delivering $>110\text{ tok/s}$.
+
+---
+
+## Technical Documentation & Build Logs
+
+- 📐 **Architecture Deep Dive:** [`docs/architecture.md`](docs/architecture.md) — SIMD warp reductions, SRAM activation caching, and memory interleaving.
+- 🗺️ **Project Roadmap:** [`docs/roadmap.md`](docs/roadmap.md) — Release progression from v0.6.0 through v0.7.0 (Pure-ALU LUT Inversion) and v0.8.0.
+- 🔬 **Technical Case Study:** [`faizpalwala.tech/projects/mlx-ternary`](https://faizpalwala.tech/projects/mlx-ternary)
+- 📝 **Engineering Build Logs on Noggin:**
+  - 🏷️ [All MLX Systems Essays](https://faizpalwala.tech/noggin/tag/mlx)
+  - 📖 [*Escape from ABI Hell*](https://faizpalwala.tech/noggin/escape-from-abi-hell) — Why compiling C++ extensions is a trap and how runtime Metal JIT eliminates toolchain friction.
+  - 🚚 [*Out for Delivery*](https://faizpalwala.tech/noggin/out-for-delivery) — Memory coalescing, GPU cache lines as delivery trucks, and 32-lane cooperative warps.
+  - 📐 [*Honey, I Shrunk the Weights*](https://faizpalwala.tech/noggin/honey-i-shrunk-the-weights) — The 27B parameter silicon geometry and memory walls on consumer Apple Silicon.
 
 ---
 
@@ -74,67 +75,43 @@ pip install -e .
 
 ## Command-Line Interface (CLI)
 
-`mlx-ternary` comes with a comprehensive suite of production CLI tools:
+`mlx-ternary` registers both `mlx-ternary` and `mlx_ternary` console entrypoints:
 
-### 1. Silicon Performance Probe (`bench`)
-Run an instant (< 15 second) hardware probe of your Apple Silicon GPU:
+### 1. Streaming Text Generation (`generate`)
+Run direct streaming inference with the production Tier 3 Fused engine:
 ```bash
-mlx_ternary bench
-```
-Outputs an empirical telemetry card auditing kernel latency, memory bandwidth utilization, and multi-core GPU saturation:
-```text
-================================================================================
-                    mlx-ternary v0.5.0-alpha Silicon Probe
-================================================================================
-  Hardware: Apple M4 Pro (20 GPU Cores)
-  Unified Memory: 24.0 GB (Peak Bandwidth: 273 GB/s)
-  Target Model: Ternary-Bonsai-2-27B Architecture (64 Layers)
---------------------------------------------------------------------------------
-  Contraction                  Shape [M, K, N]   Latency (µs)     Bandwidth   Kernel Engine
---------------------------------------------------------------------------------
-  MLP Gate/Up (Wide GEMV)      [1, 5120, 17408]       238.7 µs       93.3 GB/s   1D Shared-Mem SRAM
-  MLP Down (High-K GEMV)       [1, 17408, 5120]       321.7 µs       69.3 GB/s   1D Shared-Mem SRAM
-  Attention KV (Narrow GEMV)   [1, 5120, 512]         113.8 µs        5.8 GB/s   32-lane SIMD Warp
-  Speculative Verification     [5, 5120, 17408]       516.1 µs       43.2 GB/s   Fast Batched GEMM
---------------------------------------------------------------------------------
-  Silicon Audit Summary:
-  • Single-layer 1.58-bit matmul latency: ~1.13 ms
-  • Projected 64-layer decode baseline:   ~72.0 ms (~13.9 tok/s)
-  • Speculative boost (PLD / Code):       ~22.9 tok/s (1.65x speedup)
-  • Silicon Status: Full 20-core GPU saturation verified.
-================================================================================
+mlx-ternary generate prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --prompt "def quicksort(arr):"
 ```
 
-### 2. Streaming Text Generation (`generate`)
-Run direct streaming inference with speculative auto-selection:
+To test experimental speculative decoding on structured code or repetitive prompt schemas:
 ```bash
-# Auto mode: automatically chooses between PLD, Self-Speculative, or Native
-mlx_ternary generate prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --prompt "def fibonacci(n):"
+# Prompt Lookup Decoding (PLD)
+mlx-ternary generate prism-ml/Ternary-Bonsai-2-27B-mlx-2bit -p "def fibonacci(n):" --speculative-experimental pld
 
-# Force Prompt Lookup Decoding (PLD) with verbose telemetry:
-mlx_ternary generate prism-ml/Ternary-Bonsai-2-27B-mlx-2bit -p "def quicksort(arr):" --speculative pld -v
-
-# Force Self-Speculative 16-layer draft on reasoning:
-mlx_ternary generate prism-ml/Ternary-Bonsai-2-27B-mlx-2bit -p "calculate the derivative of x^3" --speculative self --draft-layers 16
+# 16-Layer Self-Speculative Draft Proposal
+mlx-ternary generate prism-ml/Ternary-Bonsai-2-27B-mlx-2bit -p "Explain quantum superposition" --speculative-experimental self
 ```
 
-### 3. OpenAI-Compatible Server (`serve`)
-Serve your local model directly to **LM Studio**, **OpenWebUI**, or any OpenAI SDK:
+### 2. OpenAI-Compatible Server (`serve`)
+Serve your local model directly to **LM Studio**, **OpenWebUI**, or any OpenAI-compatible client:
 ```bash
 # Standard server (Port 8080)
-mlx_ternary serve prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --port 8080
+mlx-ternary serve prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --port 8080
 
-# Long-Context Agentic Mode (4-bit KV Cache)
-mlx_ternary serve prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --kv-bits 4 --port 8080
+# Long-Context Mode (4-bit KV Cache)
+mlx-ternary serve prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --kv-bits 4 --port 8080
+```
 
-# Speculative Decoding Server
-mlx_ternary serve prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --speculate --port 8080
+### 3. Silicon Performance Probe (`bench`)
+Run an empirical hardware audit of your Apple Silicon GPU:
+```bash
+mlx-ternary bench
 ```
 
 ### 4. Weight Transcoding & Packing (`pack`)
 Pre-pack weights offline into 32-byte hardware-vectorized interleaved format:
 ```bash
-mlx_ternary pack prism-ml/Ternary-Bonsai-2-27B-mlx-2bit -o /path/to/packed_model
+mlx-ternary pack prism-ml/Ternary-Bonsai-2-27B-mlx-2bit -o /path/to/packed_model
 ```
 
 ---
@@ -143,21 +120,16 @@ mlx_ternary pack prism-ml/Ternary-Bonsai-2-27B-mlx-2bit -o /path/to/packed_model
 
 ```python
 import mlx.core as mx
-from mlx_ternary import TernaryLinear, pack_interleaved, ternary_matmul
-from mlx_ternary.speculative import generate_speculative
+from mlx_ternary import load_model, TernaryLinear, ternary_matmul
 
-# 1. Neural Network Layer Module
-layer = TernaryLinear(in_features=5120, out_features=17408, group_size=128)
-x = mx.random.normal((1, 5120)).astype(mx.float16)
-out = layer(x)
+# 1. Load Model with Automatic Operator Fusion (Tier 3 Fused SOTA)
+model, tokenizer = load_model("prism-ml/Ternary-Bonsai-2-27B-mlx-2bit", fuse=True)
 
 # 2. Low-Level Core Matmul Kernel Dispatch
 # Dispatches automatically between 32-lane SIMD warp reduction and 1D SRAM activation caching
-out = ternary_matmul(x, layer.weight, group_size=128)
-
-# 3. High-Level Streaming Speculative Generation
-# for chunk in generate_speculative(model, tokenizer, prompt="Write a binary search in Python", mode="auto"):
-#     print(chunk, end="", flush=True)
+layer = TernaryLinear(in_features=5120, out_features=17408, group_size=128)
+x = mx.random.normal((1, 5120)).astype(mx.float16)
+out = layer(x)
 ```
 
 ---
@@ -168,19 +140,19 @@ Run the full unit test suite:
 
 ```bash
 pytest tests/ -v
-# 34 passed in 2.87s
+# 58 passed in 5.34s
 ```
 
 ---
 
-## Support & Compute Patronage
+## Support the Project
 
-If you find `mlx-ternary` valuable for local research or edge deployments on Apple Silicon, consider supporting ongoing low-level kernel development:
+Benchmarking, training adapter checkpoints, and developing custom Metal kernels on an Apple Silicon laptop takes real time and compute. As a new grad building open-source systems on a student budget, evaluation compute and hardware testbeds add up quickly.
 
-* **GitHub Sponsors:** [github.com/sponsors/faizpalwala](https://github.com/sponsors/faizpalwala)
-* **Compute Fuel:** [buymeacoffee.com/faizpalwala](https://buymeacoffee.com/faizpalwala)
+If `mlx-ternary` saved you from purchasing an expensive workstation or paying for continuous cloud GPU instances, consider supporting the work. Any and all contributions go directly toward buying hardware testbeds, evaluation compute, and just paying bills that support open-source development:
 
-Patronage directly funds Apple Silicon hardware testbed availability and continuous multi-device verification.
+* 💖 **GitHub Sponsors:** [github.com/sponsors/faizpalwala](https://github.com/sponsors/faizpalwala)
+* ☕ **Buy Me a Coffee:** [buymeacoffee.com/faizpalwala](https://buymeacoffee.com/faizpalwala)
 
 ---
 

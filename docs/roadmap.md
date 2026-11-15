@@ -34,7 +34,7 @@ The focus of `v0.6.0` is establishing a rock-solid, production-grade baseline fo
 
 ## Upcoming Milestone: v0.7.0 (Performance Expansion)
 
-*Target: Q1 2027*
+*Target: Christmas 2026*
 
 The focus of `v0.7.0` is pushing memory bus efficiency from $70 - 95\text{ GB/s}$ toward the physical bandwidth ceiling ($>140\text{ GB/s}$) via Pure-ALU decompression and register pressure reduction.
 
@@ -53,7 +53,7 @@ The focus of `v0.7.0` is pushing memory bus efficiency from $70 - 95\text{ GB/s}
 
 ## Future Horizon: v0.8.0 (Enterprise Serving & Multi-Model)
 
-*Target: Mid 2027*
+*Target: Q1 2027*
 
 Scaling `mlx-ternary` for multi-tenant, multi-agent local production environments:
 
