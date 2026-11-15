@@ -4,7 +4,7 @@ from .loader import auto_fuse_model_layers, load_model
 from .quantize import pack_interleaved
 from . import speculative
 
-__version__ = "0.5.0a0"
+__version__ = "0.6.0"
 
 __all__ = [
     "__version__",
