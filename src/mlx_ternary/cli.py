@@ -10,6 +10,16 @@ from .quantize import pack_interleaved
 CACHE_DIR = Path.home() / ".cache" / "mlx_ternary"
 DEFAULT_DRAFT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
+SPECULATIVE_EXPERIMENTAL_BANNER = """
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ 🔬 EXPERIMENTAL FEATURE: SPECULATIVE DECODING (RFC-002)                      ║
+║ Speculative decoding is an active research preview. While Prompt Lookup     ║
+║ (PLD) accelerates repetitive/structured JSON schemas, open-ended text       ║
+║ falls back to baseline autoregressive decode.                                ║
+║ For maximum sustained throughput, run without --speculative-experimental.   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
 def download_and_transcode(repo_id: str, output_dir: str = None) -> Path:
     local_path = Path(repo_id)
     if local_path.exists() and local_path.is_dir():
@@ -115,6 +125,7 @@ def serve(
     print(f"Booting server for {repo_id}...")
     draft = None
     if speculate or draft_model:
+        print(SPECULATIVE_EXPERIMENTAL_BANNER, file=sys.stderr)
         draft = draft_model if draft_model else DEFAULT_DRAFT_MODEL
         print(f"Speculative Decoding ENABLED. Draft model: {draft}")
 
@@ -131,7 +142,7 @@ def serve(
 def generate_cli(
     repo_id: str,
     prompt: str,
-    speculative: str = "auto",
+    speculative: str = "none",
     num_draft_tokens: int = 4,
     draft_layers: int = None,
     draft_model: str = "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
@@ -141,6 +152,9 @@ def generate_cli(
 ):
     from .server import setup_model_loader
     from .speculative.router import generate_speculative
+
+    if speculative != "none":
+        print(SPECULATIVE_EXPERIMENTAL_BANNER, file=sys.stderr)
 
     local_path = Path(repo_id)
     if local_path.exists() and local_path.is_dir():
@@ -318,7 +332,14 @@ def main():
     serve_parser.add_argument("repo_id", help="Hugging Face Repo ID or local directory")
     serve_parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface (default: 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
-    serve_parser.add_argument("--speculate", action="store_true", help="Enable speculative decoding with a default draft model.")
+    serve_parser.add_argument(
+        "--speculative-experimental",
+        "--speculate",
+        dest="speculate",
+        action="store_true",
+        default=False,
+        help="Enable experimental speculative decoding draft server (RFC-002)",
+    )
     serve_parser.add_argument("--draft", dest="draft_model", type=str, help="Specify a custom draft model for speculative decoding.")
     serve_parser.add_argument("--kv-bits", type=int, choices=[4, 8, 16], default=None, help="KV cache quantization bits (4, 8, or 16/FP16)")
     serve_parser.add_argument("--kv-group-size", type=int, default=64, help="KV cache quantization group size")
@@ -335,11 +356,13 @@ def main():
     generate_parser.add_argument("prompt_pos", nargs="?", default=None, help="Prompt text (if not provided via --prompt)")
     generate_parser.add_argument("--prompt", "-p", type=str, default=None, help="Prompt text")
     generate_parser.add_argument(
+        "--speculative-experimental",
         "--speculative",
+        dest="speculative",
         type=str,
-        choices=["auto", "pld", "self", "qwen", "none"],
-        default="auto",
-        help="Speculative decoding mode (default: auto)",
+        choices=["none", "pld", "self", "qwen", "auto"],
+        default="none",
+        help="Enable experimental speculative decoding preview [pld|self|qwen|auto] (default: none / pure fused autoregressive)",
     )
     generate_parser.add_argument(
         "--num-draft-tokens",

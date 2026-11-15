@@ -227,11 +227,10 @@ def test_generate_speculative_auto_self_dispatch():
 
 def test_cli_generate_argument_parsing():
     import sys
-    from mlx_ternary.cli import main
     import argparse
+    from mlx_ternary.cli import SPECULATIVE_EXPERIMENTAL_BANNER
 
-    # Test parser creation and arguments
-    from mlx_ternary import cli
+    # Test parser creation and arguments matching CLI
     parser = argparse.ArgumentParser(prog="mlx_ternary")
     subparsers = parser.add_subparsers(dest="command")
 
@@ -239,28 +238,36 @@ def test_cli_generate_argument_parsing():
     gen_p.add_argument("repo_id")
     gen_p.add_argument("prompt_pos", nargs="?", default=None)
     gen_p.add_argument("--prompt", "-p", default=None)
-    gen_p.add_argument("--speculative", default="auto", choices=["auto", "pld", "self", "qwen", "none"])
+    gen_p.add_argument(
+        "--speculative-experimental",
+        "--speculative",
+        dest="speculative",
+        type=str,
+        choices=["none", "pld", "self", "qwen", "auto"],
+        default="none",
+        help="Enable experimental speculative decoding preview [pld|self|qwen|auto] (default: none)",
+    )
     gen_p.add_argument("--draft-layers", type=int, default=16)
     gen_p.add_argument("--draft-model", default="mlx-community/Qwen2.5-0.5B-Instruct-4bit")
     gen_p.add_argument("--max-tokens", type=int, default=256)
     gen_p.add_argument("--verbose", "-v", action="store_true")
 
-    # Positional prompt
+    # Positional prompt with default arguments (pure fused autoregressive)
     args = parser.parse_args(["generate", "my-org/my-model", "def test(): pass"])
     assert args.command == "generate"
     assert args.repo_id == "my-org/my-model"
     assert args.prompt_pos == "def test(): pass"
-    assert args.speculative == "auto"
+    assert args.speculative == "none"
     assert args.draft_layers == 16
     assert args.max_tokens == 256
     assert args.verbose is False
 
-    # Flagged prompt with options
+    # Flagged prompt with explicit --speculative-experimental option
     args2 = parser.parse_args([
         "generate",
         "my-model",
         "--prompt", "calculate 2+2",
-        "--speculative", "self",
+        "--speculative-experimental", "self",
         "--draft-layers", "8",
         "--max-tokens", "100",
         "--verbose",
@@ -270,6 +277,50 @@ def test_cli_generate_argument_parsing():
     assert args2.draft_layers == 8
     assert args2.max_tokens == 100
     assert args2.verbose is True
+
+    # Legacy alias --speculative also works
+    args3 = parser.parse_args([
+        "generate",
+        "my-model",
+        "-p", "Hello",
+        "--speculative", "pld",
+    ])
+    assert args3.speculative == "pld"
+
+
+def test_cli_speculative_experimental_banner(tmp_path, capsys):
+    from unittest.mock import patch, MagicMock
+    from mlx_ternary.cli import generate_cli, SPECULATIVE_EXPERIMENTAL_BANNER
+
+    assert "EXPERIMENTAL FEATURE: SPECULATIVE DECODING" in SPECULATIVE_EXPERIMENTAL_BANNER
+
+    # Mock server setup and model loading to test banner printing
+    mock_model = MagicMock()
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.decode.return_value = "world"
+
+    with patch("mlx_ternary.server.setup_model_loader", return_value=lambda: (mock_model, mock_tokenizer)), \
+         patch("mlx_ternary.speculative.router.generate_speculative", return_value=iter(["world"])):
+
+        # 1. Default (none): No banner printed to stderr
+        generate_cli(
+            repo_id=str(tmp_path),
+            prompt="Hello",
+            speculative="none",
+            max_tokens=10,
+        )
+        captured = capsys.readouterr()
+        assert "EXPERIMENTAL FEATURE: SPECULATIVE DECODING" not in captured.err
+
+        # 2. Speculative (pld): Banner printed to stderr
+        generate_cli(
+            repo_id=str(tmp_path),
+            prompt="Hello",
+            speculative="pld",
+            max_tokens=10,
+        )
+        captured2 = capsys.readouterr()
+        assert "EXPERIMENTAL FEATURE: SPECULATIVE DECODING" in captured2.err
 
 
 def test_cli_bench_argument_parsing():

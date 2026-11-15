@@ -86,6 +86,8 @@ def run_server(
     ]
 
     if draft_model:
+        from .cli import SPECULATIVE_EXPERIMENTAL_BANNER
+        print(SPECULATIVE_EXPERIMENTAL_BANNER, file=sys.stderr)
         print(f"[mlx_ternary] Speculative Decoding enabled with draft model: {draft_model}")
         server_args.extend(["--draft-model", draft_model])
 
@@ -99,7 +101,14 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, required=True, help="Path to model directory")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface")
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
-    parser.add_argument("--draft-model", type=str, default=None, help="Draft model for speculative decoding")
+    parser.add_argument(
+        "--speculative-experimental",
+        "--draft-model",
+        dest="draft_model",
+        type=str,
+        default=None,
+        help="Draft model for experimental speculative decoding (RFC-002)",
+    )
     parser.add_argument("--kv-bits", type=int, choices=[4, 8, 16], default=None, help="KV cache quantization bits (4, 8, or 16/FP16)")
     parser.add_argument("--kv-group-size", type=int, default=64, help="KV cache quantization group size")
     parser.add_argument("--max-kv-size", type=int, default=None, help="Maximum KV cache size for rotating/sliding window")
