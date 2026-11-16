@@ -50,7 +50,7 @@ Benchmarking **Ternary-Bonsai-2-27B** (27.2B parameters, 64 Transformer layers, 
 - 🗺️ **Project Roadmap:** [`docs/roadmap.md`](docs/roadmap.md) — Release progression from v0.6.0 through v0.7.0 (Pure-ALU LUT Inversion) and v0.8.0.
 - 🔬 **Technical Case Study:** [`faizpalwala.tech/projects/mlx-ternary`](https://faizpalwala.tech/projects/mlx-ternary)
 - 📝 **Engineering Build Logs on Noggin:**
-  - 🏷️ [All MLX Systems Essays](https://faizpalwala.tech/noggin/tag/mlx)
+  - 🏷️ [All MLX Systems Essays](https://faizpalwala.tech/noggin/tag/mlx-ternary)
   - 📖 [*Escape from ABI Hell*](https://faizpalwala.tech/noggin/escape-from-abi-hell) — Why compiling C++ extensions is a trap and how runtime Metal JIT eliminates toolchain friction.
   - 🚚 [*Out for Delivery*](https://faizpalwala.tech/noggin/out-for-delivery) — Memory coalescing, GPU cache lines as delivery trucks, and 32-lane cooperative warps.
   - 📐 [*Honey, I Shrunk the Weights*](https://faizpalwala.tech/noggin/honey-i-shrunk-the-weights) — The 27B parameter silicon geometry and memory walls on consumer Apple Silicon.
