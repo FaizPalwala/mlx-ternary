@@ -25,7 +25,7 @@ pip install mlx-ternary
 ## 3. Editable Installation (from Source)
 
 ```bash
-git clone https://github.com/base3labs/mlx-ternary.git
+git clone https://github.com/FaizPalwala/mlx-ternary.git
 cd mlx-ternary
 pip install -e .
 ```

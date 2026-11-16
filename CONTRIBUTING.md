@@ -28,7 +28,7 @@ Before submitting a pull request, ensure your code complies with our three core 
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/base3labs/mlx-ternary.git
+   git clone https://github.com/FaizPalwala/mlx-ternary.git
    cd mlx-ternary
    ```
 
