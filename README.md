@@ -36,6 +36,13 @@ Benchmarking **Ternary-Bonsai-2-27B** (27.2B parameters, 64 Transformer layers, 
 | **Workload B** (Agentic Dialog) | Official Bonsai<br>**mlx-ternary v0.6.0** | $99.63\text{ tok/s}$ ($10.04\text{ ms}$)<br>**$111.56\text{ tok/s}$ ($8.96\text{ ms}$)** | **$15.20\text{ tok/s}$** ($65.81\text{ ms}$)<br>**$15.20\text{ tok/s}$** ($65.81\text{ ms}$) | $7.15\text{ GB}$<br>**$6.37\text{ GB}$** (-0.78 GB) | Reference<br>**100% Bit-Exact** |
 | **Workload C** (GSM8K Math) | Official Bonsai<br>**mlx-ternary v0.6.0** | $101.99\text{ tok/s}$ ($9.80\text{ ms}$)<br>**$95.18\text{ tok/s}$ ($10.51\text{ ms}$)** | **$15.46\text{ tok/s}$** ($64.67\text{ ms}$)<br>**$15.46\text{ tok/s}$** ($64.67\text{ ms}$) | $7.15\text{ GB}$<br>**$6.37\text{ GB}$** (-0.78 GB) | Reference<br>**100% Bit-Exact** |
 
+### Sub-Byte Architecture: True 1.58-Bit vs. Naive 2-Bit Padding
+
+A ternary weight ($\{-1, 0, +1\}$) carries theoretical entropy of $\log_2(3) \approx 1.585\text{ bits}$.
+
+- **Naive Implementations (2.25 bits/weight):** Prior attempts at MLX ternary formats store each ternary trit into an uncompressed 2-bit integer slot with group-64 scaling ($2 + 16/64 = 2.25\text{ bits/weight}$). Because the weights remain uncompressed, resident RAM is identical to standard 2-bit uniform quants with zero memory savings.
+- **`mlx-ternary` (True Sub-Byte Compression):** Packs 5 trits into a single 8-bit byte ($3^5 = 243 \le 256$), achieving an empirical footprint of $\sim 1.625\text{ bits/weight}$ including scales. This allows a 27.2B model to run in a flat **6.37 GB RAM footprint**, leaving over 17 GB of unified memory completely free for 32k context windows on standard 24 GB Apple laptops.
+
 ### Kernel Micro-Benchmarks (M4 Pro Hardware Testbed)
 - **MLP Gate/Up ($5120 \times 17408$):** **$234.3\text{ }\mu\text{s}$** ($95.1\text{ GB/s}$ sustained, 1D SRAM activation caching).
 - **MLP Down ($17408 \times 5120$):** **$321.7\text{ }\mu\text{s}$** ($69.3\text{ GB/s}$ sustained, high-$K$ SRAM caching).
