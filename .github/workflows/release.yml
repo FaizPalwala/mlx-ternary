@@ -8,7 +8,7 @@ on:
 jobs:
   build-and-publish:
     name: Build distributions and publish to PyPI
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/mlx-ternary
